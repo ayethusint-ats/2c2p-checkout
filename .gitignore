@@ -1,0 +1,18 @@
+# Secrets / local config
+appsettings.Development.json
+.env
+
+# .NET build output
+bin/
+obj/
+
+# Node
+node_modules/
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+*.pdf
