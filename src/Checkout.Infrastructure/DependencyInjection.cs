@@ -1,4 +1,5 @@
 using Checkout.Application.Abstractions;
+using Checkout.Application.Checkout;
 using Checkout.Application.Payments;
 using Checkout.Infrastructure.Caching;
 using Checkout.Infrastructure.Payments.TwoCTwoP;
@@ -61,6 +62,7 @@ public static class DependencyInjection
         // One multiplexer for the whole app: it is thread-safe and designed to be shared.
         services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(options));
         services.AddSingleton<ICacheService, RedisCacheService>();
+        services.AddSingleton<IDistributedLock, RedisDistributedLock>();
     }
 
     private static void AddTwoCTwoP(IServiceCollection services, IConfiguration configuration)
@@ -81,7 +83,8 @@ public static class DependencyInjection
         {
             var options = sp.GetRequiredService<IOptions<TwoCTwoPOptions>>().Value;
             client.BaseAddress = new Uri(options.BaseUrl);
-            client.Timeout = TimeSpan.FromSeconds(30);
+            // Shared constant: CheckoutOptions validates that the lock TTL outlives this timeout.
+            client.Timeout = TimeSpan.FromSeconds(CheckoutOptions.ProviderTimeoutSeconds);
         });
     }
 

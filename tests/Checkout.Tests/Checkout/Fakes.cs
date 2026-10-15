@@ -1,4 +1,5 @@
 using Checkout.Application.Abstractions;
+using Checkout.Application.Common;
 using Checkout.Application.Dtos;
 using Checkout.Application.Payments;
 using Checkout.Domain.Entities;
@@ -29,9 +30,24 @@ internal sealed class FakeTransactionRepository : ITransactionRepository
 
     public List<Transaction> Saved { get; } = [];
     public int SaveCount { get; private set; }
+    public int FindCount { get; private set; }
 
-    public Task<Transaction?> FindByIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct) =>
-        Task.FromResult(Saved.SingleOrDefault(t => t.IdempotencyKey == idempotencyKey));
+    /// <summary>Runs before each lookup with the 1-based call number, e.g. to make a row appear mid-wait.</summary>
+    public Action<int>? BeforeFind { get; set; }
+
+    /// <summary>
+    /// Simulates losing the race at the unique index: the next insert is rejected and this
+    /// row (the winner's) becomes visible instead.
+    /// </summary>
+    public Transaction? DuplicateOnSaveWinner { get; set; }
+
+    public Task<Transaction?> FindByIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct)
+    {
+        // Increment separately: in "BeforeFind?.Invoke(++FindCount)" the ++ would be skipped when BeforeFind is null.
+        FindCount++;
+        BeforeFind?.Invoke(FindCount);
+        return Task.FromResult(Saved.SingleOrDefault(t => t.IdempotencyKey == idempotencyKey));
+    }
 
     public Task AddAsync(Transaction transaction, CancellationToken ct)
     {
@@ -41,10 +57,56 @@ internal sealed class FakeTransactionRepository : ITransactionRepository
 
     public Task SaveChangesAsync(CancellationToken ct)
     {
+        SaveCount++;
+
+        if (DuplicateOnSaveWinner is { } winner && _pending.Count > 0)
+        {
+            var loser = _pending[0];
+            _pending.Clear();
+            Saved.Add(winner);
+            DuplicateOnSaveWinner = null;
+            throw new DuplicateIdempotencyKeyException(loser.IdempotencyKey);
+        }
+
         Saved.AddRange(_pending);
         _pending.Clear();
-        SaveCount++;
         return Task.CompletedTask;
+    }
+}
+
+internal enum LockBehaviour { Acquire, Busy, Throw }
+
+internal sealed class FakeDistributedLock : IDistributedLock
+{
+    public LockBehaviour Behaviour { get; set; } = LockBehaviour.Acquire;
+    public List<FakeLockHandle> Handles { get; } = [];
+    public List<string> Keys { get; } = [];
+
+    public Task<ILockHandle?> TryAcquireAsync(string key, TimeSpan ttl, CancellationToken ct)
+    {
+        Keys.Add(key);
+        switch (Behaviour)
+        {
+            case LockBehaviour.Busy:
+                return Task.FromResult<ILockHandle?>(null);
+            case LockBehaviour.Throw:
+                throw new InvalidOperationException("Redis is down (simulated)");
+            default:
+                var handle = new FakeLockHandle();
+                Handles.Add(handle);
+                return Task.FromResult<ILockHandle?>(handle);
+        }
+    }
+}
+
+internal sealed class FakeLockHandle : ILockHandle
+{
+    public int DisposeCount { get; private set; }
+
+    public ValueTask DisposeAsync()
+    {
+        DisposeCount++;
+        return ValueTask.CompletedTask;
     }
 }
 

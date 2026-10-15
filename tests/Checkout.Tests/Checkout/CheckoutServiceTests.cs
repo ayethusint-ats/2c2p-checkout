@@ -19,6 +19,7 @@ public class CheckoutServiceTests
     private readonly FakeProductRepository _products = new();
     private readonly FakeTransactionRepository _transactions = new();
     private readonly FakePaymentProvider _provider = new();
+    private readonly FakeDistributedLock _lock = new();
     private readonly CheckoutService _service;
 
     public CheckoutServiceTests()
@@ -37,12 +38,19 @@ public class CheckoutServiceTests
         };
 
         _service = new CheckoutService(
-            _customers, _products, _transactions, _provider,
+            _customers, _products, _transactions, _provider, _lock,
             new FixedTimeProvider(Now),
             Options.Create(new AppOptions
             {
                 FrontendBaseUrl = "http://localhost:3000/",
                 PublicApiBaseUrl = "https://abc.tunnel.example",
+            }),
+            // Tiny wait/poll values so timeout tests finish quickly.
+            Options.Create(new CheckoutOptions
+            {
+                LockTtlSeconds = 45,
+                WaitTimeoutSeconds = 0.2,
+                PollIntervalMilliseconds = 10,
             }),
             NullLogger<CheckoutService>.Instance);
     }
@@ -239,4 +247,160 @@ public class CheckoutServiceTests
         await _service.CheckoutAsync(Command(key: "22222222-2222-2222-2222-222222222222"), CancellationToken.None);
         Assert.Equal(new string('a', 246), _provider.Requests[^1].Description);
     }
+
+    // ---- Step 6: lock, wait, and the database as the final guard ----
+
+    private const string Key = "6f1c2c1e-7d1b-4a37-9b1a-0e5d1b9e2f11";
+
+    private static Transaction StoredTransaction(
+        TransactionStatus status = TransactionStatus.Pending, string? redirectUrl = "https://pay/winner",
+        int productId = OneTimeProductId) => new()
+    {
+        CustomerId = CustomerId,
+        ProductId = productId,
+        InvoiceNo = "INV20261015WINNER01",
+        IdempotencyKey = Key,
+        Amount = 89.90m,
+        Currency = "SGD",
+        Status = status,
+        RedirectUrl = redirectUrl,
+        PaymentToken = redirectUrl is null ? null : "PT_WINNER",
+    };
+
+    [Fact]
+    public async Task Lock_key_is_derived_from_the_idempotency_key()
+    {
+        await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        Assert.Equal($"lock:checkout:{Key}", Assert.Single(_lock.Keys));
+    }
+
+    [Fact]
+    public async Task Same_key_with_a_different_product_throws_reuse()
+    {
+        await _service.CheckoutAsync(Command(OneTimeProductId), CancellationToken.None);
+
+        await Assert.ThrowsAsync<IdempotencyKeyReuseException>(() =>
+            _service.CheckoutAsync(Command(RecurringProductId), CancellationToken.None));
+        Assert.Single(_provider.Requests);
+    }
+
+    [Fact]
+    public async Task Lock_busy_returns_the_result_once_the_other_request_completes()
+    {
+        _lock.Behaviour = LockBehaviour.Busy;
+        // The other request's row appears (complete) on the 3rd lookup, i.e. while we are waiting.
+        _transactions.BeforeFind = call =>
+        {
+            if (call == 3)
+                _transactions.Saved.Add(StoredTransaction());
+        };
+
+        var result = await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        Assert.Equal(new CheckoutResult("INV20261015WINNER01", TransactionStatus.Pending, "https://pay/winner"), result);
+        Assert.Empty(_provider.Requests);
+    }
+
+    [Fact]
+    public async Task Lock_busy_and_no_result_in_time_throws_in_progress()
+    {
+        _lock.Behaviour = LockBehaviour.Busy;
+
+        await Assert.ThrowsAsync<CheckoutInProgressException>(() =>
+            _service.CheckoutAsync(Command(), CancellationToken.None));
+
+        Assert.Empty(_provider.Requests);
+        Assert.True(_transactions.FindCount > 2, "should have polled more than once");
+    }
+
+    [Fact]
+    public async Task Stuck_pending_row_without_redirect_is_never_retried()
+    {
+        // Pending, no payment page, and nobody holds the lock: the original request died.
+        _transactions.Saved.Add(StoredTransaction(redirectUrl: null));
+
+        await Assert.ThrowsAsync<CheckoutInProgressException>(() =>
+            _service.CheckoutAsync(Command(), CancellationToken.None));
+
+        Assert.Empty(_provider.Requests);
+        Assert.Empty(_lock.Keys);
+    }
+
+    [Fact]
+    public async Task Redis_down_still_checks_out_once_without_a_lock()
+    {
+        _lock.Behaviour = LockBehaviour.Throw;
+
+        var result = await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        Assert.Single(_provider.Requests);
+        var tx = Assert.Single(_transactions.Saved);
+        Assert.Equal(TransactionStatus.Pending, tx.Status);
+        Assert.Equal(tx.RedirectUrl, result.RedirectUrl);
+    }
+
+    [Fact]
+    public async Task Redis_down_and_database_rejects_duplicate_returns_the_winners_result()
+    {
+        _lock.Behaviour = LockBehaviour.Throw;
+        _transactions.DuplicateOnSaveWinner = StoredTransaction();
+
+        var result = await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        Assert.Equal(new CheckoutResult("INV20261015WINNER01", TransactionStatus.Pending, "https://pay/winner"), result);
+        Assert.Empty(_provider.Requests);
+        Assert.Single(_transactions.Saved);
+    }
+
+    [Fact]
+    public async Task Lock_is_released_after_success()
+    {
+        await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        Assert.Equal(1, Assert.Single(_lock.Handles).DisposeCount);
+    }
+
+    [Fact]
+    public async Task Lock_is_released_after_a_failed_payment_token_result()
+    {
+        _provider.Respond = _ => new PaymentTokenResult(false, null, null, "9042", "Invalid currency code.");
+
+        await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        Assert.Equal(1, Assert.Single(_lock.Handles).DisposeCount);
+    }
+
+    [Fact]
+    public async Task Lock_is_released_after_a_provider_exception()
+    {
+        _provider.Respond = _ => throw new PaymentProviderException("timed out");
+
+        await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        Assert.Equal(1, Assert.Single(_lock.Handles).DisposeCount);
+    }
+
+    [Fact]
+    public async Task Lock_is_released_when_validation_throws()
+    {
+        await Assert.ThrowsAsync<NotFoundException>(() =>
+            _service.CheckoutAsync(Command(productId: 999), CancellationToken.None));
+
+        Assert.Equal(1, Assert.Single(_lock.Handles).DisposeCount);
+    }
+
+    [Fact]
+    public async Task Provider_and_outcome_save_ignore_client_cancellation_once_the_row_exists()
+    {
+        using var cts = new CancellationTokenSource();
+        // The client disconnects while 2C2P is being called.
+        _provider.OnCall = cts.Cancel;
+
+        var result = await _service.CheckoutAsync(Command(), cts.Token);
+
+        Assert.Equal(TransactionStatus.Pending, result.Status);
+        Assert.NotNull(Assert.Single(_transactions.Saved).RedirectUrl);
+    }
 }
+

@@ -36,10 +36,14 @@ public static class CheckoutEndpoints
     [EndpointSummary("Start a checkout on the 2C2P hosted payment page")]
     [EndpointDescription(
         "Creates a Pending transaction for the product's current price and returns the 2C2P payment page URL. " +
-        "Status is Failed (with no redirectUrl) if 2C2P rejected the request or could not be reached.")]
+        "Status is Failed (with no redirectUrl) if 2C2P rejected the request or could not be reached. " +
+        "409 (with Retry-After): another request with the same key is still running; retry with the same key. " +
+        "422: the key was already used for a different customer or product.")]
     [ProducesResponseType<CheckoutResult>(StatusCodes.Status200OK)]
     [ProducesResponseType<HttpValidationProblemDetails>(StatusCodes.Status400BadRequest, "application/problem+json")]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound, "application/problem+json")]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict, "application/problem+json")]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity, "application/problem+json")]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status501NotImplemented, "application/problem+json")]
     private static async Task<Results<Ok<CheckoutResult>, ValidationProblem>> Checkout(
         CheckoutRequest body,
@@ -68,7 +72,7 @@ public static class CheckoutEndpoints
         // Canonical form ("d" = lowercase, hyphenated), so "{ABC…}" and "abc…" are the same key.
         var command = new CheckoutCommand(body.CustomerId, body.ProductId, body.CustomerCardId, key.ToString("D"));
 
-        // NotFoundException -> 404 and FeatureNotImplementedException -> 501 via GlobalExceptionHandler.
+        // Application exceptions become 404/409/422/501 in GlobalExceptionHandler.
         return TypedResults.Ok(await checkout.CheckoutAsync(command, ct));
     }
 }
