@@ -1,10 +1,13 @@
 using Checkout.Application.Abstractions;
+using Checkout.Application.Payments;
 using Checkout.Infrastructure.Caching;
+using Checkout.Infrastructure.Payments.TwoCTwoP;
 using Checkout.Infrastructure.Persistence;
 using Checkout.Infrastructure.Persistence.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
 namespace Checkout.Infrastructure;
@@ -19,6 +22,7 @@ public static class DependencyInjection
     {
         AddPersistence(services, configuration);
         AddRedis(services, configuration);
+        AddTwoCTwoP(services, configuration);
         return services;
     }
 
@@ -56,6 +60,28 @@ public static class DependencyInjection
         // One multiplexer for the whole app: it is thread-safe and designed to be shared.
         services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(options));
         services.AddSingleton<ICacheService, RedisCacheService>();
+    }
+
+    private static void AddTwoCTwoP(IServiceCollection services, IConfiguration configuration)
+    {
+        // ValidateOnStart: a missing merchant ID or key stops the app at startup with a clear
+        // message, instead of failing on the first payment.
+        services.AddOptions<TwoCTwoPOptions>()
+            .Bind(configuration.GetSection(TwoCTwoPOptions.SectionName))
+            .Validate(o => !string.IsNullOrWhiteSpace(o.MerchantId), "TwoCTwoP:MerchantId is not configured.")
+            .Validate(o => !string.IsNullOrWhiteSpace(o.SecretKey), "TwoCTwoP:SecretKey is not configured.")
+            .Validate(o => Uri.TryCreate(o.BaseUrl, UriKind.Absolute, out _) && o.BaseUrl.EndsWith('/'),
+                "TwoCTwoP:BaseUrl must be an absolute URL ending with '/'.")
+            .ValidateOnStart();
+
+        // Typed client: IHttpClientFactory manages the handler pool (no socket exhaustion, DNS refresh).
+        // No retry handler on purpose: a payment request must not be sent twice automatically.
+        services.AddHttpClient<IPaymentProvider, TwoCTwoPPaymentProvider>((sp, client) =>
+        {
+            var options = sp.GetRequiredService<IOptions<TwoCTwoPOptions>>().Value;
+            client.BaseAddress = new Uri(options.BaseUrl);
+            client.Timeout = TimeSpan.FromSeconds(30);
+        });
     }
 
     /// <summary>Applies pending migrations, then runs the seeder (EF calls it as part of Migrate).</summary>

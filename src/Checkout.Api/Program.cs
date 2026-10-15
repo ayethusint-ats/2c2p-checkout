@@ -40,6 +40,9 @@ if (app.Environment.IsDevelopment())
         options.SwaggerEndpoint("/openapi/v1.json", "Checkout API v1");
         options.RoutePrefix = "swagger";
     });
+
+    // TODO(Step 5): remove together with Endpoints/DevEndpoints.cs.
+    app.MapDevEndpoints();
 }
 
 // Liveness probe: answers "is the process up?" without touching MySQL or Redis.
