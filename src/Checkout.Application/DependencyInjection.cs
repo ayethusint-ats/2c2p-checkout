@@ -1,4 +1,6 @@
 using Checkout.Application.Catalog;
+using Checkout.Application.Checkout;
+using Checkout.Application.Common;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -13,6 +15,19 @@ public static class DependencyInjection
         // Scoped because it depends on repositories, which share the request's DbContext.
         services.AddScoped<CatalogService>();
 
+        services.AddOptions<AppOptions>()
+            .Bind(configuration.GetSection(AppOptions.SectionName))
+            .Validate(o => IsAbsoluteHttpUrl(o.FrontendBaseUrl), "App:FrontendBaseUrl must be an absolute http(s) URL.")
+            .Validate(o => IsAbsoluteHttpUrl(o.PublicApiBaseUrl), "App:PublicApiBaseUrl must be an absolute http(s) URL.")
+            .ValidateOnStart();
+
+        // Injected clock, so tests can fix "now" (invoice date, created_at).
+        services.AddSingleton(TimeProvider.System);
+        services.AddScoped<ICheckoutService, CheckoutService>();
+
         return services;
     }
+
+    private static bool IsAbsoluteHttpUrl(string value) =>
+        Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https";
 }

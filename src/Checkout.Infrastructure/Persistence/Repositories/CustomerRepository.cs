@@ -1,5 +1,6 @@
 using Checkout.Application.Abstractions;
 using Checkout.Application.Dtos;
+using Checkout.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 
 namespace Checkout.Infrastructure.Persistence.Repositories;
@@ -15,4 +16,8 @@ internal sealed class CustomerRepository(CheckoutDbContext db) : ICustomerReposi
 
     public Task<bool> ExistsAsync(int id, CancellationToken ct) =>
         db.Customers.AnyAsync(c => c.Id == id, ct);
+
+    // Read-only: checkout only needs to know the customer exists, so no change tracking.
+    public Task<Customer?> FindAsync(int id, CancellationToken ct) =>
+        db.Customers.AsNoTracking().FirstOrDefaultAsync(c => c.Id == id, ct);
 }

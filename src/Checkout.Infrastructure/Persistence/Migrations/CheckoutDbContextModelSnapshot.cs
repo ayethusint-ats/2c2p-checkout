@@ -205,6 +205,11 @@ namespace Checkout.Infrastructure.Persistence.Migrations
                         .HasColumnType("varchar(50)")
                         .HasColumnName("provider_ref");
 
+                    b.Property<string>("RedirectUrl")
+                        .HasMaxLength(1000)
+                        .HasColumnType("varchar(1000)")
+                        .HasColumnName("redirect_url");
+
                     b.Property<string>("RespCode")
                         .HasMaxLength(10)
                         .HasColumnType("varchar(10)")

@@ -28,6 +28,7 @@ internal sealed class TransactionConfiguration : IEntityTypeConfiguration<Transa
             .HasMaxLength(20);
 
         builder.Property(t => t.PaymentToken).HasColumnName("payment_token").HasMaxLength(200);
+        builder.Property(t => t.RedirectUrl).HasColumnName("redirect_url").HasMaxLength(1000);
         builder.Property(t => t.PaymentChannel).HasColumnName("payment_channel").HasMaxLength(20);
         builder.Property(t => t.MaskedCardNo).HasColumnName("masked_card_no").HasMaxLength(30);
         builder.Property(t => t.ProviderRef).HasColumnName("provider_ref").HasMaxLength(50);

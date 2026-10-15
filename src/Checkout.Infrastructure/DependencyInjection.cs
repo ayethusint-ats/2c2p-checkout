@@ -41,6 +41,7 @@ public static class DependencyInjection
         services.AddScoped<ICustomerRepository, CustomerRepository>();
         services.AddScoped<IProductRepository, ProductRepository>();
         services.AddScoped<ICustomerCardRepository, CustomerCardRepository>();
+        services.AddScoped<ITransactionRepository, TransactionRepository>();
     }
 
     private static void AddRedis(IServiceCollection services, IConfiguration configuration)
