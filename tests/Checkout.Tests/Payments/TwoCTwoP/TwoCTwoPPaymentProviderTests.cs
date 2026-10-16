@@ -146,6 +146,118 @@ public class TwoCTwoPPaymentProviderTests
             provider.CreatePaymentTokenAsync(Request(PaymentIntent.NewPaymentMethod), CancellationToken.None));
     }
 
+    // ---- backend notification ----
+
+    private static string SignedNotification(object payload, string secret = Secret) =>
+        Hs256Jwt.Sign(JsonSerializer.Serialize(payload), secret);
+
+    private static object NotificationPayload(object amount, string merchantId = MerchantId) => new
+    {
+        merchantID = merchantId,
+        invoiceNo = "INV20261015A1B2C3D4",
+        accountNo = "411111XXXXXX1111",
+        amount,
+        currencyCode = "SGD",
+        tranRef = "4589123",
+        channelCode = "VI",
+        respCode = "0000",
+        respDesc = "Success",
+        customerToken = "CUST_TOKEN_ABC",
+    };
+
+    [Theory]
+    [InlineData("89.90")]
+    [InlineData(89.90)]
+    public void Notification_with_valid_signature_is_parsed(object amount)
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException("no HTTP for notifications"));
+
+        var result = provider.VerifyAndParseNotification(SignedNotification(NotificationPayload(amount)));
+
+        Assert.NotNull(result);
+        Assert.Equal(new PaymentResultInfo(MerchantId, "INV20261015A1B2C3D4", 89.90m, "SGD", "0000", "Success",
+            "VI", "411111XXXXXX1111", "4589123", "CUST_TOKEN_ABC"), result);
+    }
+
+    [Fact]
+    public void Notification_without_optional_fields_is_parsed_with_nulls()
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+        var jwt = SignedNotification(new
+        {
+            merchantID = MerchantId, invoiceNo = "INV1", amount = "10.00", currencyCode = "SGD",
+            respCode = "4012", respDesc = "Declined",
+        });
+
+        var result = provider.VerifyAndParseNotification(jwt);
+
+        Assert.NotNull(result);
+        Assert.Equal(10.00m, result.Amount);
+        Assert.Null(result.ChannelCode);
+        Assert.Null(result.AccountNo);
+        Assert.Null(result.TranRef);
+        Assert.Null(result.CustomerToken);
+    }
+
+    [Fact]
+    public void Notification_signed_with_wrong_key_is_rejected()
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+
+        Assert.Null(provider.VerifyAndParseNotification(SignedNotification(NotificationPayload("89.90"), "attacker-key")));
+    }
+
+    [Fact]
+    public void Tampered_notification_is_rejected()
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+        var parts = SignedNotification(NotificationPayload("89.90")).Split('.');
+        var forged = System.Buffers.Text.Base64Url.EncodeToString(
+            System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(NotificationPayload("0.01"))));
+
+        Assert.Null(provider.VerifyAndParseNotification($"{parts[0]}.{forged}.{parts[2]}"));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("garbage")]
+    [InlineData("a.b.c")]
+    [InlineData("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..")]
+    public void Garbage_notification_is_rejected(string payload)
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+
+        Assert.Null(provider.VerifyAndParseNotification(payload));
+    }
+
+    [Fact]
+    public void Notification_for_another_merchant_is_rejected()
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+
+        Assert.Null(provider.VerifyAndParseNotification(SignedNotification(NotificationPayload("89.90", merchantId: "OTHER"))));
+    }
+
+    [Theory]
+    [InlineData("abc")]
+    [InlineData("1,000.00")]
+    [InlineData("-5.00")]
+    [InlineData(true)]
+    public void Notification_with_unparseable_amount_is_rejected(object amount)
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+
+        Assert.Null(provider.VerifyAndParseNotification(SignedNotification(NotificationPayload(amount))));
+    }
+
+    [Fact]
+    public void Signed_notification_that_is_not_a_json_object_is_rejected()
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+
+        Assert.Null(provider.VerifyAndParseNotification(Hs256Jwt.Sign("[1,2,3]", Secret)));
+    }
+
     // ---- helpers ----
 
     private static readonly object SuccessPayload = new

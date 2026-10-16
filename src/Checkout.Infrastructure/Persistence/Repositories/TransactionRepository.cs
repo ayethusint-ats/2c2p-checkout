@@ -1,8 +1,8 @@
 using Checkout.Application.Abstractions;
 using Checkout.Application.Common;
 using Checkout.Domain.Entities;
+using Checkout.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
-using MySqlConnector;
 
 namespace Checkout.Infrastructure.Persistence.Repositories;
 
@@ -15,6 +15,9 @@ internal sealed class TransactionRepository(CheckoutDbContext db) : ITransaction
     public Task<Transaction?> FindByIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct) =>
         db.Transactions.AsNoTracking().FirstOrDefaultAsync(t => t.IdempotencyKey == idempotencyKey, ct);
 
+    public Task<Transaction?> FindByInvoiceNoAsync(string invoiceNo, CancellationToken ct) =>
+        db.Transactions.AsNoTracking().FirstOrDefaultAsync(t => t.InvoiceNo == invoiceNo, ct);
+
     // Tracked from here on, so later changes (AttachPaymentToken, MarkFailed) are saved as UPDATEs.
     public async Task AddAsync(Transaction transaction, CancellationToken ct) =>
         await db.Transactions.AddAsync(transaction, ct);
@@ -25,7 +28,7 @@ internal sealed class TransactionRepository(CheckoutDbContext db) : ITransaction
         {
             await db.SaveChangesAsync(ct);
         }
-        catch (DbUpdateException ex) when (IsDuplicateIdempotencyKey(ex))
+        catch (DbUpdateException ex) when (MySqlErrors.IsDuplicateKey(ex, IdempotencyKeyIndex))
         {
             // Stop tracking the rejected row, so a later SaveChanges on this context doesn't retry the INSERT.
             foreach (var entry in ex.Entries)
@@ -36,9 +39,26 @@ internal sealed class TransactionRepository(CheckoutDbContext db) : ITransaction
         }
     }
 
-    // Error 1062 alone means "some unique index"; the index name tells us it is this one
-    // (and not, say, a colliding invoice_no). MySQL 8: "Duplicate entry '…' for key 'transaction.ux_…'".
-    private static bool IsDuplicateIdempotencyKey(DbUpdateException ex) =>
-        ex.InnerException is MySqlException { ErrorCode: MySqlErrorCode.DuplicateKeyEntry } mysql
-        && mysql.Message.Contains(IdempotencyKeyIndex, StringComparison.Ordinal);
+    // The status check is part of the UPDATE itself, so MySQL decides atomically:
+    // of two concurrent results, exactly one sees status = 'Pending' and changes the row.
+    public Task<int> MarkSucceededIfPendingAsync(long id, string? paymentChannel, string? maskedCardNo,
+        string? providerRef, string respCode, string respDesc, DateTime paidAtUtc, CancellationToken ct) =>
+        db.Transactions
+            .Where(t => t.Id == id && t.Status == TransactionStatus.Pending)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(t => t.Status, TransactionStatus.Succeeded)
+                .SetProperty(t => t.PaymentChannel, paymentChannel)
+                .SetProperty(t => t.MaskedCardNo, maskedCardNo)
+                .SetProperty(t => t.ProviderRef, providerRef)
+                .SetProperty(t => t.RespCode, respCode)
+                .SetProperty(t => t.RespDesc, respDesc)
+                .SetProperty(t => t.PaidAt, paidAtUtc), ct);
+
+    public Task<int> MarkFailedIfPendingAsync(long id, string respCode, string respDesc, CancellationToken ct) =>
+        db.Transactions
+            .Where(t => t.Id == id && t.Status == TransactionStatus.Pending)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(t => t.Status, TransactionStatus.Failed)
+                .SetProperty(t => t.RespCode, respCode)
+                .SetProperty(t => t.RespDesc, respDesc), ct);
 }

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -58,6 +59,75 @@ internal sealed class TwoCTwoPPaymentProvider(
             request.InvoiceNo, request.Intent, result.RespCode);
 
         return result;
+    }
+
+    public PaymentResultInfo? VerifyAndParseNotification(string payload)
+    {
+        var settings = options.Value;
+
+        // Verify first: nothing in the payload is read or trusted until the signature checks out.
+        if (string.IsNullOrEmpty(payload) || !Hs256Jwt.TryVerify(payload, settings.SecretKey, out var payloadJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(payloadJson);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return null;
+
+            var merchantId = GetString(root, "merchantID");
+            var invoiceNo = GetString(root, "invoiceNo");
+            var currencyCode = GetString(root, "currencyCode");
+            var respCode = GetString(root, "respCode");
+
+            if (string.IsNullOrEmpty(merchantId) || string.IsNullOrEmpty(invoiceNo)
+                || string.IsNullOrEmpty(currencyCode) || string.IsNullOrEmpty(respCode)
+                || !TryGetAmount(root, out var amount))
+            {
+                return null;
+            }
+
+            // Correctly signed, but for another merchant account: not ours to apply.
+            if (!string.Equals(merchantId, settings.MerchantId, StringComparison.Ordinal))
+                return null;
+
+            return new PaymentResultInfo(
+                merchantId,
+                invoiceNo,
+                amount,
+                currencyCode,
+                respCode,
+                GetString(root, "respDesc") ?? string.Empty,
+                GetString(root, "channelCode"),
+                GetString(root, "accountNo"),
+                GetString(root, "tranRef"),
+                GetString(root, "customerToken"));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string? GetString(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+    // 2C2P may send the amount as a number (230.87) or a string ("230.87"). Invariant culture,
+    // and only digits with an optional decimal point: no sign, no thousands separators.
+    private static bool TryGetAmount(JsonElement root, out decimal amount)
+    {
+        amount = 0;
+        if (!root.TryGetProperty("amount", out var value))
+            return false;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number => value.TryGetDecimal(out amount),
+            JsonValueKind.String => decimal.TryParse(value.GetString(), NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture, out amount),
+            _ => false,
+        };
     }
 
     // Maps our provider-neutral intent onto 2C2P's request fields.

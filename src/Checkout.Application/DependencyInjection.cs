@@ -1,6 +1,7 @@
 using Checkout.Application.Catalog;
 using Checkout.Application.Checkout;
 using Checkout.Application.Common;
+using Checkout.Application.Payments;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -32,6 +33,7 @@ public static class DependencyInjection
         // Injected clock, so tests can fix "now" (invoice date, created_at).
         services.AddSingleton(TimeProvider.System);
         services.AddScoped<ICheckoutService, CheckoutService>();
+        services.AddScoped<IPaymentResultProcessor, PaymentResultProcessor>();
 
         return services;
     }

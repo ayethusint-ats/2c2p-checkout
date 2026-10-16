@@ -3,6 +3,7 @@ using Checkout.Application.Common;
 using Checkout.Application.Dtos;
 using Checkout.Application.Payments;
 using Checkout.Domain.Entities;
+using Checkout.Domain.Enums;
 
 namespace Checkout.Tests.Checkout;
 
@@ -47,6 +48,43 @@ internal sealed class FakeTransactionRepository : ITransactionRepository
         FindCount++;
         BeforeFind?.Invoke(FindCount);
         return Task.FromResult(Saved.SingleOrDefault(t => t.IdempotencyKey == idempotencyKey));
+    }
+
+    public Task<Transaction?> FindByInvoiceNoAsync(string invoiceNo, CancellationToken ct) =>
+        Task.FromResult(Saved.SingleOrDefault(t => t.InvoiceNo == invoiceNo));
+
+    public int ConditionalUpdateCount { get; private set; }
+
+    // Emulates "UPDATE … WHERE id = @id AND status = 'Pending'": changes the row only if Pending.
+    public Task<int> MarkSucceededIfPendingAsync(long id, string? paymentChannel, string? maskedCardNo,
+        string? providerRef, string respCode, string respDesc, DateTime paidAtUtc, CancellationToken ct)
+    {
+        ConditionalUpdateCount++;
+        var tx = Saved.SingleOrDefault(t => t.Id == id && t.Status == TransactionStatus.Pending);
+        if (tx is null)
+            return Task.FromResult(0);
+
+        tx.Status = TransactionStatus.Succeeded;
+        tx.PaymentChannel = paymentChannel;
+        tx.MaskedCardNo = maskedCardNo;
+        tx.ProviderRef = providerRef;
+        tx.RespCode = respCode;
+        tx.RespDesc = respDesc;
+        tx.PaidAt = paidAtUtc;
+        return Task.FromResult(1);
+    }
+
+    public Task<int> MarkFailedIfPendingAsync(long id, string respCode, string respDesc, CancellationToken ct)
+    {
+        ConditionalUpdateCount++;
+        var tx = Saved.SingleOrDefault(t => t.Id == id && t.Status == TransactionStatus.Pending);
+        if (tx is null)
+            return Task.FromResult(0);
+
+        tx.Status = TransactionStatus.Failed;
+        tx.RespCode = respCode;
+        tx.RespDesc = respDesc;
+        return Task.FromResult(1);
     }
 
     public Task AddAsync(Transaction transaction, CancellationToken ct)
@@ -126,6 +164,34 @@ internal sealed class FakePaymentProvider : IPaymentProvider
         Requests.Add(request);
         OnCall?.Invoke();
         return Task.FromResult(Respond(request));
+    }
+
+    public PaymentResultInfo? VerifyAndParseNotification(string payload) => throw new NotSupportedException();
+}
+
+/// <summary>Emulates the unique index on (customer_id, customer_token).</summary>
+internal sealed class FakeCustomerCardRepository : ICustomerCardRepository
+{
+    public List<CustomerCard> Cards { get; } = [];
+
+    public Task<IReadOnlyList<SavedCardDto>> GetByCustomerIdAsync(int customerId, CancellationToken ct) =>
+        throw new NotSupportedException();
+
+    public Task<bool> AddIfNotExistsAsync(int customerId, string customerToken, string maskedCardNo,
+        DateTime createdAtUtc, CancellationToken ct)
+    {
+        if (Cards.Any(c => c.CustomerId == customerId && c.CustomerToken == customerToken))
+            return Task.FromResult(false);
+
+        Cards.Add(new CustomerCard
+        {
+            Id = Cards.Count + 1,
+            CustomerId = customerId,
+            CustomerToken = customerToken,
+            MaskedCardNo = maskedCardNo,
+            CreatedAt = createdAtUtc,
+        });
+        return Task.FromResult(true);
     }
 }
 
