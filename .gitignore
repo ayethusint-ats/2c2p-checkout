@@ -5,6 +5,7 @@ appsettings.Development.json
 # .NET build output
 bin/
 obj/
+docs/
 
 # Node
 node_modules/
@@ -16,3 +17,4 @@ node_modules/
 *.user
 .DS_Store
 *.pdf
+*.md
