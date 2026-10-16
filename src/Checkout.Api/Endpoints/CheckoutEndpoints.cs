@@ -33,18 +33,22 @@ public static class CheckoutEndpoints
 
     public sealed record CheckoutRequest(int CustomerId, int ProductId, int? CustomerCardId);
 
-    [EndpointSummary("Start a checkout on the 2C2P hosted payment page")]
+    [EndpointSummary("Start a checkout: 2C2P hosted payment page, or charge a saved card")]
     [EndpointDescription(
-        "Creates a Pending transaction for the product's current price and returns the 2C2P payment page URL. " +
-        "Status is Failed (with no redirectUrl) if 2C2P rejected the request or could not be reached. " +
+        "Creates a Pending transaction for the product's current price. " +
+        "Without customerCardId: returns the 2C2P payment page URL as redirectUrl. " +
+        "With customerCardId: charges that saved card. The result is Succeeded or Failed when 2C2P answers at once; " +
+        "Pending with a redirectUrl when the customer must complete 3-D Secure; Pending without a redirectUrl when " +
+        "the outcome is not known yet (poll GET /api/transactions/{invoiceNo}). " +
+        "Status is Failed (with no redirectUrl) if 2C2P rejected the payment token request or could not be reached. " +
+        "404: unknown customer or product, or a card that does not belong to the customer. " +
         "409 (with Retry-After): another request with the same key is still running; retry with the same key. " +
-        "422: the key was already used for a different customer or product.")]
+        "422: the key was already used for a different customer, product or card.")]
     [ProducesResponseType<CheckoutResult>(StatusCodes.Status200OK)]
     [ProducesResponseType<HttpValidationProblemDetails>(StatusCodes.Status400BadRequest, "application/problem+json")]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound, "application/problem+json")]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict, "application/problem+json")]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity, "application/problem+json")]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status501NotImplemented, "application/problem+json")]
     private static async Task<Results<Ok<CheckoutResult>, ValidationProblem>> Checkout(
         CheckoutRequest body,
         [FromHeader(Name = IdempotencyKeyHeader)] string? idempotencyKey,
@@ -72,7 +76,7 @@ public static class CheckoutEndpoints
         // Canonical form ("d" = lowercase, hyphenated), so "{ABC…}" and "abc…" are the same key.
         var command = new CheckoutCommand(body.CustomerId, body.ProductId, body.CustomerCardId, key.ToString("D"));
 
-        // Application exceptions become 404/409/422/501 in GlobalExceptionHandler.
+        // Application exceptions become 404/409/422 in GlobalExceptionHandler.
         return TypedResults.Ok(await checkout.CheckoutAsync(command, ct));
     }
 }

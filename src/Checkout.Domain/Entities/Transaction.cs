@@ -47,11 +47,21 @@ public class Transaction
     /// <summary>UTC; null until the payment succeeds.</summary>
     public DateTime? PaidAt { get; set; }
 
-    /// <summary>The provider created a payment page for this attempt; it stays Pending until paid.</summary>
-    public void AttachPaymentToken(string paymentToken, string redirectUrl)
+    /// <summary>
+    /// The provider created a payment token for this attempt; it stays Pending until paid.
+    /// A saved-card payment has no page yet, so <paramref name="redirectUrl"/> may be null.
+    /// </summary>
+    public void AttachPaymentToken(string paymentToken, string? redirectUrl = null)
     {
         EnsurePending(nameof(AttachPaymentToken));
         PaymentToken = paymentToken;
+        RedirectUrl = redirectUrl;
+    }
+
+    /// <summary>The customer must finish this payment at <paramref name="redirectUrl"/> (e.g. a 3-D Secure challenge).</summary>
+    public void SetRedirectUrl(string redirectUrl)
+    {
+        EnsurePending(nameof(SetRedirectUrl));
         RedirectUrl = redirectUrl;
     }
 

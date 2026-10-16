@@ -2,6 +2,7 @@ using Checkout.Application.Catalog;
 using Checkout.Application.Checkout;
 using Checkout.Application.Common;
 using Checkout.Application.Payments;
+using Checkout.Application.Transactions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -24,8 +25,9 @@ public static class DependencyInjection
 
         services.AddOptions<CheckoutOptions>()
             .Bind(configuration.GetSection(CheckoutOptions.SectionName))
-            .Validate(o => o.LockTtlSeconds > CheckoutOptions.ProviderTimeoutSeconds,
-                $"Checkout:LockTtlSeconds must exceed the {CheckoutOptions.ProviderTimeoutSeconds} s provider timeout.")
+            .Validate(o => o.LockTtlSeconds > CheckoutOptions.MaxProviderCallsPerCheckout * CheckoutOptions.ProviderTimeoutSeconds,
+                $"Checkout:LockTtlSeconds must exceed {CheckoutOptions.MaxProviderCallsPerCheckout} provider calls " +
+                $"of {CheckoutOptions.ProviderTimeoutSeconds} s each.")
             .Validate(o => o.WaitTimeoutSeconds > 0, "Checkout:WaitTimeoutSeconds must be positive.")
             .Validate(o => o.PollIntervalMilliseconds > 0, "Checkout:PollIntervalMilliseconds must be positive.")
             .ValidateOnStart();
@@ -34,6 +36,7 @@ public static class DependencyInjection
         services.AddSingleton(TimeProvider.System);
         services.AddScoped<ICheckoutService, CheckoutService>();
         services.AddScoped<IPaymentResultProcessor, PaymentResultProcessor>();
+        services.AddScoped<ITransactionStatusService, TransactionStatusService>();
 
         return services;
     }

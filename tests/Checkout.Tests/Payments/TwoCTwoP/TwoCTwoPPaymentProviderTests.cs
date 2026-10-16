@@ -258,6 +258,202 @@ public class TwoCTwoPPaymentProviderTests
         Assert.Null(provider.VerifyAndParseNotification(Hs256Jwt.Sign("[1,2,3]", Secret)));
     }
 
+    // ---- Do Payment (saved card) ----
+
+    [Fact]
+    public async Task DoPayment_sends_plain_json_with_exactly_the_expected_fields()
+    {
+        var (provider, handler) = Create(_ => Json(new { respCode = "2000", respDesc = "Completed" }));
+
+        await provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None);
+
+        Assert.Equal(HttpMethod.Post, handler.Request!.Method);
+        Assert.Equal(new Uri(BaseUrl + "payment"), handler.Request.RequestUri);
+
+        using var body = JsonDocument.Parse(handler.RequestBody!);
+        var root = body.RootElement;
+        Assert.Equal(["locale", "payment", "paymentToken"], PropertyNames(root));
+        Assert.Equal("PT_1", root.GetProperty("paymentToken").GetString());
+        Assert.Equal("en", root.GetProperty("locale").GetString());
+
+        var payment = root.GetProperty("payment");
+        Assert.Equal(["code", "data"], PropertyNames(payment));
+        Assert.Equal(["channelCode"], PropertyNames(payment.GetProperty("code")));
+        Assert.Equal("CC", payment.GetProperty("code").GetProperty("channelCode").GetString());
+        Assert.Equal(["customerToken"], PropertyNames(payment.GetProperty("data")));
+        Assert.Equal("CUST_TOKEN_1", payment.GetProperty("data").GetProperty("customerToken").GetString());
+    }
+
+    [Fact]
+    public async Task DoPayment_plain_json_response_is_parsed()
+    {
+        var (provider, _) = Create(_ => Json(new { respCode = "2000", respDesc = "Transaction is completed" }));
+
+        var result = await provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None);
+
+        Assert.Equal(new DoPaymentResult(DoPaymentNextStep.InquireResult, "2000", "Transaction is completed", null), result);
+    }
+
+    [Fact]
+    public async Task DoPayment_jwt_wrapped_response_is_verified_and_parsed()
+    {
+        var (provider, _) = Create(_ => Signed(new { respCode = "1000", respDesc = "Redirect", data = "https://3ds.example/c" }));
+
+        var result = await provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None);
+
+        Assert.Equal(new DoPaymentResult(DoPaymentNextStep.RedirectBrowser, "1000", "Redirect", "https://3ds.example/c"), result);
+    }
+
+    [Fact]
+    public async Task DoPayment_jwt_wrapped_response_with_wrong_signature_throws()
+    {
+        var (provider, _) = Create(_ => Signed(new { respCode = "2000", respDesc = "Completed" }, secret: "attacker-key"));
+
+        await Assert.ThrowsAsync<PaymentProviderException>(() =>
+            provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("2000")]
+    [InlineData("4200")]
+    [InlineData("9999")]
+    public async Task DoPayment_2000_and_unknown_codes_mean_InquireResult(string respCode)
+    {
+        var (provider, _) = Create(_ => Json(new { respCode, respDesc = "x" }));
+
+        var result = await provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None);
+
+        Assert.Equal(DoPaymentNextStep.InquireResult, result.NextStep);
+        Assert.Null(result.RedirectUrl);
+    }
+
+    [Theory]
+    [InlineData("1000")]
+    [InlineData("1001")]
+    public async Task DoPayment_redirect_codes_with_https_url_mean_RedirectBrowser(string respCode)
+    {
+        var (provider, _) = Create(_ => Json(new { respCode, respDesc = "Redirect", data = "https://3ds.example/c" }));
+
+        var result = await provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None);
+
+        Assert.Equal(DoPaymentNextStep.RedirectBrowser, result.NextStep);
+        Assert.Equal("https://3ds.example/c", result.RedirectUrl);
+    }
+
+    [Theory]
+    [InlineData("http://3ds.example/c")]
+    [InlineData("javascript:alert(1)")]
+    [InlineData("/relative/path")]
+    [InlineData("")]
+    [InlineData(null)]
+    public async Task DoPayment_redirect_code_without_absolute_https_url_throws(string? data)
+    {
+        var (provider, _) = Create(_ => Json(new { respCode = "1001", respDesc = "Redirect", data }));
+
+        await Assert.ThrowsAsync<PaymentProviderException>(() =>
+            provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DoPayment_2001_means_WaitForResult()
+    {
+        var (provider, _) = Create(_ => Json(new { respCode = "2001", respDesc = "In progress" }));
+
+        var result = await provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None);
+
+        Assert.Equal(DoPaymentNextStep.WaitForResult, result.NextStep);
+    }
+
+    [Fact]
+    public async Task DoPayment_non_2xx_throws()
+    {
+        var (provider, _) = Create(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        await Assert.ThrowsAsync<PaymentProviderException>(() =>
+            provider.DoPaymentWithSavedCardAsync("PT_1", "CUST_TOKEN_1", CancellationToken.None));
+    }
+
+    // ---- Payment Inquiry ----
+
+    [Fact]
+    public async Task Inquiry_request_is_a_jwt_with_merchant_invoice_and_locale()
+    {
+        var (provider, handler) = Create(_ => Signed(InquiryPayload()));
+
+        await provider.InquirePaymentAsync("INV001", CancellationToken.None);
+
+        Assert.Equal(new Uri(BaseUrl + "paymentInquiry"), handler.Request!.RequestUri);
+        var payload = DecodeRequestPayload(handler);
+        Assert.Equal(["invoiceNo", "locale", "merchantID"], PropertyNames(payload));
+        Assert.Equal(MerchantId, payload.GetProperty("merchantID").GetString());
+        Assert.Equal("INV001", payload.GetProperty("invoiceNo").GetString());
+        Assert.Equal("en", payload.GetProperty("locale").GetString());
+    }
+
+    [Fact]
+    public async Task Inquiry_response_is_parsed()
+    {
+        var (provider, _) = Create(_ => Signed(InquiryPayload()));
+
+        var result = await provider.InquirePaymentAsync("INV001", CancellationToken.None);
+
+        Assert.Equal(new PaymentResultInfo(MerchantId, "INV001", 89.90m, "SGD", "0000", "Success",
+            "VI", "411111XXXXXX1111", "4589123", null), result);
+    }
+
+    [Fact]
+    public async Task Inquiry_response_with_only_respCode_and_respDesc_has_null_amount()
+    {
+        var (provider, _) = Create(_ => Signed(new { respCode = "2002", respDesc = "Transaction not found" }));
+
+        var result = await provider.InquirePaymentAsync("INV001", CancellationToken.None);
+
+        Assert.Equal("INV001", result.InvoiceNo);
+        Assert.Equal("2002", result.RespCode);
+        Assert.Null(result.Amount);
+        Assert.Null(result.CurrencyCode);
+    }
+
+    [Fact]
+    public async Task Inquiry_response_with_wrong_signature_throws()
+    {
+        var (provider, _) = Create(_ => Signed(InquiryPayload(), secret: "attacker-key"));
+
+        await Assert.ThrowsAsync<PaymentProviderException>(() => provider.InquirePaymentAsync("INV001", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Unsigned_inquiry_response_throws()
+    {
+        var (provider, _) = Create(_ => Json(new { respCode = "0000", respDesc = "Success", invoiceNo = "INV001", amount = 89.90 }));
+
+        await Assert.ThrowsAsync<PaymentProviderException>(() => provider.InquirePaymentAsync("INV001", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Inquiry_response_for_another_invoice_throws()
+    {
+        var (provider, _) = Create(_ => Signed(InquiryPayload(invoiceNo: "INV999")));
+
+        await Assert.ThrowsAsync<PaymentProviderException>(() => provider.InquirePaymentAsync("INV001", CancellationToken.None));
+    }
+
+    private static object InquiryPayload(string invoiceNo = "INV001") => new
+    {
+        merchantID = MerchantId,
+        invoiceNo,
+        amount = "89.90",
+        currencyCode = "SGD",
+        channelCode = "VI",
+        accountNo = "411111XXXXXX1111",
+        tranRef = "4589123",
+        respCode = "0000",
+        respDesc = "Success",
+    };
+
+    private static string[] PropertyNames(JsonElement element) =>
+        element.EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal).ToArray();
+
     // ---- helpers ----
 
     private static readonly object SuccessPayload = new

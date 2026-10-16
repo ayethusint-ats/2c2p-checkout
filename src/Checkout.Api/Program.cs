@@ -49,6 +49,7 @@ app.MapGet("/health", () => Results.Ok(new { status = "Healthy" }))
 app.MapCatalogEndpoints();
 app.MapCheckoutEndpoints();
 app.MapPaymentNotificationEndpoints();
+app.MapTransactionEndpoints();
 
 app.Run();
 

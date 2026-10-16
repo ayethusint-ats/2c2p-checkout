@@ -14,6 +14,7 @@ internal sealed class TwoCTwoPPaymentProvider(
     ILogger<TwoCTwoPPaymentProvider> logger) : IPaymentProvider
 {
     private const string SuccessCode = "0000";
+    private const string Locale = "en";
 
     // camelCase names, nulls omitted (so e.g. NewPaymentMethod sends no paymentChannel at all),
     // decimals written as JSON numbers.
@@ -29,27 +30,7 @@ internal sealed class TwoCTwoPPaymentProvider(
         var payloadJson = JsonSerializer.Serialize(BuildPayload(request, settings.MerchantId), JsonOptions);
         var body = new JwtEnvelope(Hs256Jwt.Sign(payloadJson, settings.SecretKey));
 
-        string responseBody;
-        try
-        {
-            // Relative URI: resolved against BaseAddress (…/payment/4.3/) set at registration.
-            using var response = await http.PostAsJsonAsync("paymentToken", body, JsonOptions, ct);
-
-            if (!response.IsSuccessStatusCode)
-                throw new PaymentProviderException(
-                    $"2C2P paymentToken returned HTTP {(int)response.StatusCode} for invoice {request.InvoiceNo}.");
-
-            responseBody = await response.Content.ReadAsStringAsync(ct);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new PaymentProviderException($"2C2P paymentToken request failed for invoice {request.InvoiceNo}.", ex);
-        }
-        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
-        {
-            // HttpClient.Timeout surfaces as TaskCanceledException; caller-initiated cancellation is rethrown as is.
-            throw new PaymentProviderException($"2C2P paymentToken timed out for invoice {request.InvoiceNo}.", ex);
-        }
+        var responseBody = await PostAsync("paymentToken", body, $"paymentToken for invoice {request.InvoiceNo}", ct);
 
         var result = ParseResponse(responseBody, settings.SecretKey, request.InvoiceNo);
 
@@ -58,6 +39,93 @@ internal sealed class TwoCTwoPPaymentProvider(
             "2C2P paymentToken for invoice {InvoiceNo} ({Intent}): respCode {RespCode}",
             request.InvoiceNo, request.Intent, result.RespCode);
 
+        return result;
+    }
+
+    public async Task<DoPaymentResult> DoPaymentWithSavedCardAsync(
+        string paymentToken, string customerToken, CancellationToken ct)
+    {
+        // No responseReturnUrl: we act on the response ourselves instead of having 2C2P redirect.
+        var body = new DoPaymentRequest(
+            paymentToken,
+            Locale,
+            new DoPaymentMethod(new DoPaymentCode("CC"), new DoPaymentData(customerToken)));
+
+        var responseBody = await PostAsync("payment", body, "payment (Do Payment)", ct);
+        var response = ParseDoPaymentResponse(responseBody);
+
+        if (string.IsNullOrEmpty(response.RespCode))
+            throw new PaymentProviderException("2C2P Do Payment response has no respCode.");
+
+        var respDesc = response.RespDesc ?? string.Empty;
+        var result = response.RespCode switch
+        {
+            // The customer must complete a challenge (e.g. 3-D Secure) in the browser.
+            "1000" or "1001" => new DoPaymentResult(
+                DoPaymentNextStep.RedirectBrowser, response.RespCode, respDesc, RequireHttpsUrl(response.Data)),
+
+            // Still processing: the result comes later.
+            "2001" => new DoPaymentResult(DoPaymentNextStep.WaitForResult, response.RespCode, respDesc, null),
+
+            // 2000 ("completed, inquire for the result") and every other code: Do Payment's own code
+            // is not a trustworthy payment outcome, so the inquiry decides.
+            _ => new DoPaymentResult(DoPaymentNextStep.InquireResult, response.RespCode, respDesc, null),
+        };
+
+        // Never the payment token, customer token or body.
+        logger.LogInformation("2C2P Do Payment: respCode {RespCode}, next step {NextStep}", result.RespCode, result.NextStep);
+        return result;
+    }
+
+    public async Task<PaymentResultInfo> InquirePaymentAsync(string invoiceNo, CancellationToken ct)
+    {
+        var settings = options.Value;
+
+        var payloadJson = JsonSerializer.Serialize(new PaymentInquiryRequestPayload(settings.MerchantId, invoiceNo, Locale), JsonOptions);
+        var body = new JwtEnvelope(Hs256Jwt.Sign(payloadJson, settings.SecretKey));
+
+        var responseBody = await PostAsync("paymentInquiry", body, $"paymentInquiry for invoice {invoiceNo}", ct);
+
+        ResponseBody? envelope;
+        try
+        {
+            envelope = JsonSerializer.Deserialize<ResponseBody>(responseBody, JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new PaymentProviderException($"2C2P paymentInquiry response for invoice {invoiceNo} is not valid JSON.", ex);
+        }
+
+        // The inquiry decides whether money moved, so an unsigned answer is never used, not even a failure.
+        if (envelope?.Payload is null || !Hs256Jwt.TryVerify(envelope.Payload, settings.SecretKey, out var resultJson))
+            throw new PaymentProviderException($"2C2P paymentInquiry response for invoice {invoiceNo} failed signature verification.");
+
+        PaymentResultInfo? result;
+        try
+        {
+            using var document = JsonDocument.Parse(resultJson);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                throw new PaymentProviderException($"2C2P paymentInquiry payload for invoice {invoiceNo} is not a JSON object.");
+
+            // Answers about a different payment must not be applied to this one.
+            var returnedInvoiceNo = GetString(root, "invoiceNo");
+            if (!string.IsNullOrEmpty(returnedInvoiceNo) && !string.Equals(returnedInvoiceNo, invoiceNo, StringComparison.Ordinal))
+                throw new PaymentProviderException(
+                    $"2C2P paymentInquiry for invoice {invoiceNo} returned a result for invoice {returnedInvoiceNo}.");
+
+            // Not-found or in-progress answers may carry only respCode and respDesc.
+            result = MapResult(root, GetString(root, "merchantID") ?? settings.MerchantId, invoiceNo);
+        }
+        catch (JsonException ex)
+        {
+            throw new PaymentProviderException($"2C2P paymentInquiry payload for invoice {invoiceNo} is not valid JSON.", ex);
+        }
+
+        if (result is null)
+            throw new PaymentProviderException($"2C2P paymentInquiry payload for invoice {invoiceNo} has no respCode or an invalid amount.");
+
+        logger.LogInformation("2C2P paymentInquiry for invoice {InvoiceNo}: respCode {RespCode}", invoiceNo, result.RespCode);
         return result;
     }
 
@@ -78,31 +146,14 @@ internal sealed class TwoCTwoPPaymentProvider(
 
             var merchantId = GetString(root, "merchantID");
             var invoiceNo = GetString(root, "invoiceNo");
-            var currencyCode = GetString(root, "currencyCode");
-            var respCode = GetString(root, "respCode");
-
-            if (string.IsNullOrEmpty(merchantId) || string.IsNullOrEmpty(invoiceNo)
-                || string.IsNullOrEmpty(currencyCode) || string.IsNullOrEmpty(respCode)
-                || !TryGetAmount(root, out var amount))
-            {
+            if (string.IsNullOrEmpty(merchantId) || string.IsNullOrEmpty(invoiceNo))
                 return null;
-            }
 
             // Correctly signed, but for another merchant account: not ours to apply.
             if (!string.Equals(merchantId, settings.MerchantId, StringComparison.Ordinal))
                 return null;
 
-            return new PaymentResultInfo(
-                merchantId,
-                invoiceNo,
-                amount,
-                currencyCode,
-                respCode,
-                GetString(root, "respDesc") ?? string.Empty,
-                GetString(root, "channelCode"),
-                GetString(root, "accountNo"),
-                GetString(root, "tranRef"),
-                GetString(root, "customerToken"));
+            return MapResult(root, merchantId, invoiceNo);
         }
         catch (JsonException)
         {
@@ -113,21 +164,122 @@ internal sealed class TwoCTwoPPaymentProvider(
     private static string? GetString(JsonElement root, string name) =>
         root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
+    /// <summary>
+    /// Shared by the notification and the inquiry. Only respCode is required; amount, currency and the
+    /// card details may be missing (the processor decides what a missing value means). An amount that
+    /// is present but unreadable makes the whole result invalid (null).
+    /// </summary>
+    private static PaymentResultInfo? MapResult(JsonElement root, string merchantId, string invoiceNo)
+    {
+        var respCode = GetString(root, "respCode");
+        if (string.IsNullOrEmpty(respCode) || !TryGetAmount(root, out var amount))
+            return null;
+
+        var currencyCode = GetString(root, "currencyCode");
+
+        return new PaymentResultInfo(
+            merchantId,
+            invoiceNo,
+            amount,
+            string.IsNullOrEmpty(currencyCode) ? null : currencyCode,
+            respCode,
+            GetString(root, "respDesc") ?? string.Empty,
+            GetString(root, "channelCode"),
+            GetString(root, "accountNo"),
+            GetString(root, "tranRef"),
+            GetString(root, "customerToken"));
+    }
+
     // 2C2P may send the amount as a number (230.87) or a string ("230.87"). Invariant culture,
     // and only digits with an optional decimal point: no sign, no thousands separators.
-    private static bool TryGetAmount(JsonElement root, out decimal amount)
+    // A missing (or null) amount is valid and gives null; a present but unreadable one is not.
+    private static bool TryGetAmount(JsonElement root, out decimal? amount)
     {
-        amount = 0;
-        if (!root.TryGetProperty("amount", out var value))
-            return false;
+        amount = null;
+        if (!root.TryGetProperty("amount", out var value) || value.ValueKind == JsonValueKind.Null)
+            return true;
 
-        return value.ValueKind switch
+        switch (value.ValueKind)
         {
-            JsonValueKind.Number => value.TryGetDecimal(out amount),
-            JsonValueKind.String => decimal.TryParse(value.GetString(), NumberStyles.AllowDecimalPoint,
-                CultureInfo.InvariantCulture, out amount),
-            _ => false,
-        };
+            case JsonValueKind.Number when value.TryGetDecimal(out var number):
+                amount = number;
+                return true;
+            case JsonValueKind.String when decimal.TryParse(value.GetString(), NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture, out var text):
+                amount = text;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>Posts JSON to a path under BaseUrl and returns the body. Transport problems become PaymentProviderException.</summary>
+    /// <param name="description">For error messages only; must not contain tokens.</param>
+    private async Task<string> PostAsync<T>(string path, T body, string description, CancellationToken ct)
+    {
+        try
+        {
+            // Relative URI: resolved against BaseAddress (…/payment/4.3/) set at registration.
+            using var response = await http.PostAsJsonAsync(path, body, JsonOptions, ct);
+
+            if (!response.IsSuccessStatusCode)
+                throw new PaymentProviderException($"2C2P {description} returned HTTP {(int)response.StatusCode}.");
+
+            return await response.Content.ReadAsStringAsync(ct);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new PaymentProviderException($"2C2P {description} request failed.", ex);
+        }
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            // HttpClient.Timeout surfaces as TaskCanceledException; caller-initiated cancellation is rethrown as is.
+            throw new PaymentProviderException($"2C2P {description} timed out.", ex);
+        }
+    }
+
+    // The response may be plain JSON or {"payload":"<JWT>"}. A payload is verified before anything
+    // in it is read; a payload that fails verification is an error, never a fallback to the plain body.
+    private DoPaymentResponse ParseDoPaymentResponse(string responseBody)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(responseBody);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                throw new PaymentProviderException("2C2P Do Payment response is not a JSON object.");
+
+            if (!root.TryGetProperty("payload", out var payload))
+                return ReadDoPaymentResponse(root);
+
+            if (payload.ValueKind != JsonValueKind.String
+                || !Hs256Jwt.TryVerify(payload.GetString()!, options.Value.SecretKey, out var payloadJson))
+                throw new PaymentProviderException("2C2P Do Payment response failed signature verification.");
+
+            using var decoded = JsonDocument.Parse(payloadJson);
+            if (decoded.RootElement.ValueKind != JsonValueKind.Object)
+                throw new PaymentProviderException("2C2P Do Payment payload is not a JSON object.");
+
+            return ReadDoPaymentResponse(decoded.RootElement);
+        }
+        catch (JsonException ex)
+        {
+            throw new PaymentProviderException("2C2P Do Payment response is not valid JSON.", ex);
+        }
+    }
+
+    // Read field by field rather than deserialized: "data" is only meaningful (a URL) for redirect codes,
+    // and an unexpected shape there must not turn a normal response into an error.
+    private static DoPaymentResponse ReadDoPaymentResponse(JsonElement root) =>
+        new(GetString(root, "respCode"), GetString(root, "respDesc"), GetString(root, "data"));
+
+    // The browser will be sent here, so only an absolute https URL is accepted.
+    private static string RequireHttpsUrl(string? url)
+    {
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps)
+            return url!;
+
+        throw new PaymentProviderException("2C2P Do Payment asked for a redirect without an absolute https URL.");
     }
 
     // Maps our provider-neutral intent onto 2C2P's request fields.

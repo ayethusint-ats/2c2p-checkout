@@ -39,7 +39,7 @@ public class PaymentResultProcessorTests
     }
 
     private static PaymentResultInfo Result(
-        string respCode = "0000", string respDesc = "Success", decimal amount = 89.90m, string currency = "SGD",
+        string respCode = "0000", string respDesc = "Success", decimal? amount = 89.90m, string? currency = "SGD",
         string? customerToken = "CUST_TOKEN_ABC", string invoiceNo = InvoiceNo) =>
         new("JT01", invoiceNo, amount, currency, respCode, respDesc,
             ChannelCode: "VI", AccountNo: "411111XXXXXX1111", TranRef: "4589123", CustomerToken: customerToken);
@@ -221,5 +221,57 @@ public class PaymentResultProcessorTests
         Assert.Equal(30, tx2.MaskedCardNo!.Length);
         Assert.Equal(50, tx2.ProviderRef!.Length);
         Assert.Equal(100, tx2.RespDesc!.Length);
+    }
+
+    // ---- Step 8: not-final codes and missing amounts (inquiry results) ----
+
+    [Theory]
+    [InlineData("2001")]
+    [InlineData("2002")]
+    [InlineData("2003")]
+    public async Task Not_final_codes_change_nothing(string respCode)
+    {
+        var outcome = await _processor.ApplyAsync(
+            Result(respCode, "In progress", amount: null, currency: null), CancellationToken.None);
+
+        Assert.Equal(PaymentResultOutcome.NotFinal, outcome);
+        Assert.Equal(TransactionStatus.Pending, _tx.Status);
+        Assert.Null(_tx.RespCode);
+        Assert.Equal(0, _transactions.ConditionalUpdateCount);
+        Assert.Empty(_cards.Cards);
+    }
+
+    [Theory]
+    [InlineData(null, "SGD")]
+    [InlineData(89.90, null)]
+    [InlineData(null, null)]
+    public async Task Success_without_amount_or_currency_is_a_mismatch(double? amount, string? currency)
+    {
+        var outcome = await _processor.ApplyAsync(
+            Result(amount: (decimal?)amount, currency: currency), CancellationToken.None);
+
+        Assert.Equal(PaymentResultOutcome.AmountOrCurrencyMismatch, outcome);
+        Assert.Equal(TransactionStatus.Pending, _tx.Status);
+        Assert.Empty(_cards.Cards);
+    }
+
+    [Fact]
+    public async Task Failure_without_amount_or_currency_is_applied_as_Failed()
+    {
+        var outcome = await _processor.ApplyAsync(
+            Result("4012", "Transaction declined", amount: null, currency: null), CancellationToken.None);
+
+        Assert.Equal(PaymentResultOutcome.Applied, outcome);
+        Assert.Equal(TransactionStatus.Failed, _tx.Status);
+        Assert.Equal("4012", _tx.RespCode);
+    }
+
+    [Fact]
+    public async Task Failure_with_a_wrong_amount_is_still_a_mismatch()
+    {
+        var outcome = await _processor.ApplyAsync(Result("4012", "Transaction declined", amount: 1.00m), CancellationToken.None);
+
+        Assert.Equal(PaymentResultOutcome.AmountOrCurrencyMismatch, outcome);
+        Assert.Equal(TransactionStatus.Pending, _tx.Status);
     }
 }

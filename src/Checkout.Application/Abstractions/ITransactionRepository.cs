@@ -1,3 +1,4 @@
+using Checkout.Application.Dtos;
 using Checkout.Domain.Entities;
 
 namespace Checkout.Application.Abstractions;
@@ -13,6 +14,9 @@ public interface ITransactionRepository
 
     /// <summary>Untracked, so it always reflects the current row.</summary>
     Task<Transaction?> FindByInvoiceNoAsync(string invoiceNo, CancellationToken ct);
+
+    /// <summary>The transaction joined with its product name, projected to the public DTO. Untracked.</summary>
+    Task<TransactionStatusDto?> GetStatusAsync(string invoiceNo, CancellationToken ct);
 
     /// <summary>
     /// One conditional UPDATE (… WHERE id = @id AND status = 'Pending'), without loading the row.

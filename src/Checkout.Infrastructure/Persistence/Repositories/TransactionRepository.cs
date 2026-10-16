@@ -1,5 +1,6 @@
 using Checkout.Application.Abstractions;
 using Checkout.Application.Common;
+using Checkout.Application.Dtos;
 using Checkout.Domain.Entities;
 using Checkout.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
@@ -17,6 +18,27 @@ internal sealed class TransactionRepository(CheckoutDbContext db) : ITransaction
 
     public Task<Transaction?> FindByInvoiceNoAsync(string invoiceNo, CancellationToken ct) =>
         db.Transactions.AsNoTracking().FirstOrDefaultAsync(t => t.InvoiceNo == invoiceNo, ct);
+
+    // An explicit join, so only the product's name is read. Status.ToString() runs in memory:
+    // EF evaluates the final Select's constructor call on the client.
+    public Task<TransactionStatusDto?> GetStatusAsync(string invoiceNo, CancellationToken ct) =>
+        (from t in db.Transactions.AsNoTracking()
+         join p in db.Products.AsNoTracking() on t.ProductId equals p.Id
+         where t.InvoiceNo == invoiceNo
+         select new TransactionStatusDto(
+             t.InvoiceNo,
+             t.Status.ToString(),
+             t.CustomerId,
+             t.ProductId,
+             p.Name,
+             t.Amount,
+             t.Currency,
+             t.PaymentChannel,
+             t.MaskedCardNo,
+             t.RespDesc,
+             t.PaidAt,
+             t.CreatedAt))
+        .FirstOrDefaultAsync(ct);
 
     // Tracked from here on, so later changes (AttachPaymentToken, MarkFailed) are saved as UPDATEs.
     public async Task AddAsync(Transaction transaction, CancellationToken ct) =>

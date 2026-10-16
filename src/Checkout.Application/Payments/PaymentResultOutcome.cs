@@ -11,6 +11,9 @@ public enum PaymentResultOutcome
     /// <summary>No transaction has this invoice number.</summary>
     UnknownInvoice,
 
-    /// <summary>The result's amount or currency differs from what we stored; nothing changed.</summary>
-    AmountOrCurrencyMismatch
+    /// <summary>The result's amount or currency differs from what we stored (or a success omitted them); nothing changed.</summary>
+    AmountOrCurrencyMismatch,
+
+    /// <summary>The provider has no final outcome yet (in progress, not found, inquiry failed); nothing changed.</summary>
+    NotFinal
 }

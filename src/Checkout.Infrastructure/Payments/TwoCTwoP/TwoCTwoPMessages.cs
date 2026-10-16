@@ -36,3 +36,21 @@ internal sealed record PaymentTokenResponsePayload(
     string? WebPaymentUrl,
     string? RespCode,
     string? RespDesc);
+
+/// <summary>
+/// Do Payment request. Unlike the other APIs this is plain JSON, not a JWT:
+/// {"paymentToken":"…","locale":"en","payment":{"code":{"channelCode":"CC"},"data":{"customerToken":"…"}}}
+/// </summary>
+internal sealed record DoPaymentRequest(string PaymentToken, string Locale, DoPaymentMethod Payment);
+
+internal sealed record DoPaymentMethod(DoPaymentCode Code, DoPaymentData Data);
+
+internal sealed record DoPaymentCode(string ChannelCode);
+
+internal sealed record DoPaymentData(string CustomerToken);
+
+/// <summary>Do Payment response (plain, or the decoded JWT payload). Data is the redirect URL for 1000/1001.</summary>
+internal sealed record DoPaymentResponse(string? RespCode, string? RespDesc, string? Data);
+
+/// <summary>Claims of the Payment Inquiry request JWT.</summary>
+internal sealed record PaymentInquiryRequestPayload(string MerchantID, string InvoiceNo, string Locale);

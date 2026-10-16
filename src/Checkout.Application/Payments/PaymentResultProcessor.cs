@@ -1,4 +1,5 @@
 using Checkout.Application.Abstractions;
+using Checkout.Domain.Entities;
 using Checkout.Domain.Enums;
 using Microsoft.Extensions.Logging;
 
@@ -16,6 +17,9 @@ public sealed class PaymentResultProcessor(
     ILogger<PaymentResultProcessor> logger) : IPaymentResultProcessor
 {
     private const string SuccessCode = "0000";
+
+    // Not an outcome of the payment: 2001 in progress, 2002 not found (yet), 2003 inquiry failed.
+    private static readonly HashSet<string> NotFinalCodes = ["2001", "2002", "2003"];
 
     // Column sizes from TransactionConfiguration / CustomerCardConfiguration.
     private const int PaymentChannelMax = 20;
@@ -38,14 +42,19 @@ public sealed class PaymentResultProcessor(
 
     private async Task<PaymentResultOutcome> ApplyCoreAsync(PaymentResultInfo result, CancellationToken ct)
     {
+        // 0. "No answer yet" must never be read as a failure: the customer may still be charged.
+        if (NotFinalCodes.Contains(result.RespCode))
+            return PaymentResultOutcome.NotFinal;
+
+        var succeeded = result.RespCode == SuccessCode;
+
         // 1. Which payment is this about?
         var transaction = await transactions.FindByInvoiceNoAsync(result.InvoiceNo, ct);
         if (transaction is null)
             return PaymentResultOutcome.UnknownInvoice;
 
         // 2. The result must be for exactly what we asked the customer to pay.
-        if (result.Amount != transaction.Amount
-            || !string.Equals(result.CurrencyCode, transaction.Currency, StringComparison.OrdinalIgnoreCase))
+        if (!MatchesTransaction(result, transaction, requireAmountAndCurrency: succeeded))
         {
             logger.LogError(
                 "Payment result for invoice {InvoiceNo} does not match the transaction: " +
@@ -58,7 +67,6 @@ public sealed class PaymentResultProcessor(
         var respDesc = Truncate(result.RespDesc, RespDescMax)!;
 
         // 3. Move Pending -> final in one conditional UPDATE. 0 rows = someone already finalised it.
-        var succeeded = result.RespCode == SuccessCode;
         var rows = succeeded
             ? await transactions.MarkSucceededIfPendingAsync(
                 transaction.Id,
@@ -106,6 +114,21 @@ public sealed class PaymentResultProcessor(
         if (inserted)
             logger.LogInformation("Saved card for customer {CustomerId} from invoice {InvoiceNo}",
                 current.CustomerId, result.InvoiceNo);
+    }
+
+    // A success must prove what was paid, so missing values count as a mismatch. A failure moves
+    // no money, so missing values are accepted, but values that are present must still match.
+    private static bool MatchesTransaction(PaymentResultInfo result, Transaction transaction, bool requireAmountAndCurrency)
+    {
+        var amountOk = result.Amount is { } amount
+            ? amount == transaction.Amount
+            : !requireAmountAndCurrency;
+
+        var currencyOk = !string.IsNullOrEmpty(result.CurrencyCode)
+            ? string.Equals(result.CurrencyCode, transaction.Currency, StringComparison.OrdinalIgnoreCase)
+            : !requireAmountAndCurrency;
+
+        return amountOk && currencyOk;
     }
 
     private static string? Truncate(string? value, int maxLength) =>

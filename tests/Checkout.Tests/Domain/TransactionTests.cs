@@ -23,6 +23,20 @@ public class TransactionTests
     }
 
     [Fact]
+    public void AttachPaymentToken_without_url_then_SetRedirectUrl_keeps_Pending()
+    {
+        var tx = NewTransaction(TransactionStatus.Pending);
+
+        tx.AttachPaymentToken("PT");
+        Assert.Null(tx.RedirectUrl);
+
+        tx.SetRedirectUrl("https://3ds");
+        Assert.Equal(TransactionStatus.Pending, tx.Status);
+        Assert.Equal("PT", tx.PaymentToken);
+        Assert.Equal("https://3ds", tx.RedirectUrl);
+    }
+
+    [Fact]
     public void MarkFailed_sets_Failed_with_codes()
     {
         var tx = NewTransaction(TransactionStatus.Pending);
@@ -43,6 +57,7 @@ public class TransactionTests
 
         Assert.Throws<InvalidOperationException>(() => tx.AttachPaymentToken("PT", "https://pay"));
         Assert.Throws<InvalidOperationException>(() => tx.MarkFailed("X", "Y"));
+        Assert.Throws<InvalidOperationException>(() => tx.SetRedirectUrl("https://3ds"));
         Assert.Equal(status, tx.Status);
     }
 }

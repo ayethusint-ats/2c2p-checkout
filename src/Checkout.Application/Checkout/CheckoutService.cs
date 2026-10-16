@@ -18,8 +18,10 @@ namespace Checkout.Application.Checkout;
 public sealed class CheckoutService(
     ICustomerRepository customers,
     IProductRepository products,
+    ICustomerCardRepository cards,
     ITransactionRepository transactions,
     IPaymentProvider paymentProvider,
+    IPaymentResultProcessor resultProcessor,
     IDistributedLock distributedLock,
     TimeProvider timeProvider,
     IOptions<AppOptions> appOptions,
@@ -77,9 +79,12 @@ public sealed class CheckoutService(
             var product = await products.FindAsync(command.ProductId, ct)
                 ?? throw new NotFoundException("Product", command.ProductId);
 
-            // Saved-card payments come in Step 8.
-            if (command.CustomerCardId is not null)
-                throw new FeatureNotImplementedException("Paying with a saved card is not available yet.");
+            // Ownership is part of the lookup: another customer's card is "not found", with the same
+            // message as a missing one, so the response doesn't reveal that the card id exists.
+            CustomerCard? card = null;
+            if (command.CustomerCardId is { } cardId)
+                card = await cards.FindForCustomerAsync(command.CustomerId, cardId, ct)
+                    ?? throw new NotFoundException("Saved card", $"{cardId} for customer {command.CustomerId}");
 
             // Record the attempt before talking to 2C2P. Amount and currency come from the product,
             // never the request. Only FK ids are set: the loaded entities are untracked, and
@@ -88,6 +93,7 @@ public sealed class CheckoutService(
             {
                 CustomerId = command.CustomerId,
                 ProductId = product.Id,
+                CustomerCardId = card?.Id,
                 InvoiceNo = NewInvoiceNo(),
                 IdempotencyKey = command.IdempotencyKey,
                 Amount = product.Price,
@@ -112,7 +118,9 @@ public sealed class CheckoutService(
 
             // From here the row exists: always finish, even if the client disconnects,
             // so it can't be left Pending without a token.
-            return await RequestPaymentPageAsync(transaction, product);
+            return card is null
+                ? await RequestPaymentPageAsync(transaction, product)
+                : await PayWithSavedCardAsync(transaction, product, card);
         }
         finally
         {
@@ -123,8 +131,92 @@ public sealed class CheckoutService(
 
     private async Task<CheckoutResult> RequestPaymentPageAsync(Transaction transaction, Product product)
     {
-        var request = BuildPaymentTokenRequest(transaction, product);
+        var result = await CreatePaymentTokenOrFailAsync(transaction, BuildPaymentTokenRequest(transaction, product, card: null));
+        if (result is null)
+            return ToResult(transaction);
 
+        transaction.AttachPaymentToken(result.PaymentToken!, result.RedirectUrl!);
+        await transactions.SaveChangesAsync(CancellationToken.None);
+        return ToResult(transaction);
+    }
+
+    /// <summary>
+    /// Payment Token (SavedCard intent), then Do Payment, then act on what 2C2P says to do next.
+    /// Once Do Payment has been sent the charge may have happened, so from there on nothing marks the
+    /// row Failed: only a verified result (inquiry or notification) can finalise it.
+    /// </summary>
+    private async Task<CheckoutResult> PayWithSavedCardAsync(Transaction transaction, Product product, CustomerCard card)
+    {
+        var invoiceNo = transaction.InvoiceNo;
+
+        // c. Nothing has been charged yet, so failures here are final (same handling as the hosted page).
+        var tokenResult = await CreatePaymentTokenOrFailAsync(transaction, BuildPaymentTokenRequest(transaction, product, card));
+        if (tokenResult is null)
+            return ToResult(transaction);
+
+        transaction.AttachPaymentToken(tokenResult.PaymentToken!);
+        // f. Saved before anything else touches the row.
+        await transactions.SaveChangesAsync(CancellationToken.None);
+
+        // d. The charge itself. An exception here means "outcome unknown", not "failed".
+        DoPaymentResult doPayment;
+        try
+        {
+            doPayment = await paymentProvider.DoPaymentWithSavedCardAsync(
+                tokenResult.PaymentToken!, card.CustomerToken, CancellationToken.None);
+        }
+        catch (PaymentProviderException ex)
+        {
+            logger.LogError(ex, "Do Payment outcome unknown for invoice {InvoiceNo}; leaving it Pending", invoiceNo);
+            return new CheckoutResult(invoiceNo, TransactionStatus.Pending, null);
+        }
+
+        logger.LogInformation("Do Payment for invoice {InvoiceNo}: respCode {RespCode}, next step {NextStep}",
+            invoiceNo, doPayment.RespCode, doPayment.NextStep);
+
+        // e. What 2C2P told us to do next.
+        switch (doPayment.NextStep)
+        {
+            case DoPaymentNextStep.RedirectBrowser:
+                transaction.SetRedirectUrl(doPayment.RedirectUrl!);
+                await transactions.SaveChangesAsync(CancellationToken.None);
+                return ToResult(transaction);
+
+            case DoPaymentNextStep.InquireResult:
+                return await InquireAndApplyAsync(invoiceNo);
+
+            default:
+                // WaitForResult: the notification (or the status endpoint's inquiry) will finish it.
+                return new CheckoutResult(invoiceNo, TransactionStatus.Pending, null);
+        }
+    }
+
+    private async Task<CheckoutResult> InquireAndApplyAsync(string invoiceNo)
+    {
+        try
+        {
+            var result = await paymentProvider.InquirePaymentAsync(invoiceNo, CancellationToken.None);
+            // The same processor as the notification: one place decides what a result means.
+            await resultProcessor.ApplyAsync(result, CancellationToken.None);
+        }
+        catch (PaymentProviderException ex)
+        {
+            logger.LogError(ex, "Payment inquiry failed for invoice {InvoiceNo}; leaving it Pending", invoiceNo);
+            return new CheckoutResult(invoiceNo, TransactionStatus.Pending, null);
+        }
+
+        // f. The processor updated the database row directly (ExecuteUpdate), so the tracked entity is
+        // stale: read the row back, and never save the tracked entity again (it would undo the update).
+        var current = await transactions.FindByInvoiceNoAsync(invoiceNo, CancellationToken.None);
+        return new CheckoutResult(invoiceNo, current?.Status ?? TransactionStatus.Pending, null);
+    }
+
+    /// <summary>
+    /// Calls Payment Token. On a rejected request or a provider exception the row is marked Failed and
+    /// saved, and null is returned. Nothing can have been charged at this point.
+    /// </summary>
+    private async Task<PaymentTokenResult?> CreatePaymentTokenOrFailAsync(Transaction transaction, PaymentTokenRequest request)
+    {
         PaymentTokenResult result;
         try
         {
@@ -136,20 +228,18 @@ public sealed class CheckoutService(
             logger.LogError(ex, "Payment provider unavailable for invoice {InvoiceNo}", transaction.InvoiceNo);
             transaction.MarkFailed("ERROR", "Payment provider unavailable");
             await transactions.SaveChangesAsync(CancellationToken.None);
-            return ToResult(transaction);
+            return null;
         }
 
+        logger.LogInformation("Payment token for invoice {InvoiceNo}: respCode {RespCode}",
+            transaction.InvoiceNo, result.RespCode);
+
         if (result.Succeeded)
-            transaction.AttachPaymentToken(result.PaymentToken!, result.RedirectUrl!);
-        else
-            transaction.MarkFailed(result.RespCode, result.RespDesc);
+            return result;
 
+        transaction.MarkFailed(result.RespCode, result.RespDesc);
         await transactions.SaveChangesAsync(CancellationToken.None);
-
-        logger.LogInformation("Checkout for invoice {InvoiceNo}: {Status} (respCode {RespCode})",
-            transaction.InvoiceNo, transaction.Status, result.RespCode);
-
-        return ToResult(transaction);
+        return null;
     }
 
     // d. A row already exists for this key.
@@ -191,10 +281,17 @@ public sealed class CheckoutService(
     private CheckoutResult? TryGetCompletedResult(Transaction existing, CheckoutCommand command)
     {
         // Same key, different checkout: a client bug, not a retry.
-        if (existing.CustomerId != command.CustomerId || existing.ProductId != command.ProductId)
+        if (existing.CustomerId != command.CustomerId
+            || existing.ProductId != command.ProductId
+            || existing.CustomerCardId != command.CustomerCardId)
             throw new IdempotencyKeyReuseException(command.IdempotencyKey);
 
-        var isComplete = existing.Status != TransactionStatus.Pending || existing.RedirectUrl is not null;
+        // A saved-card row with a payment token may already have been charged, so it is complete even
+        // while Pending: replaying it returns Pending, and the client follows up on the status endpoint.
+        // Waiting would end in 409 ("use a new key"), and a new key could charge the card twice.
+        var isComplete = existing.Status != TransactionStatus.Pending
+            || existing.RedirectUrl is not null
+            || (existing.CustomerCardId is not null && existing.PaymentToken is not null);
         if (!isComplete)
             return null;
 
@@ -205,7 +302,7 @@ public sealed class CheckoutService(
 
     private static string LockKey(string idempotencyKey) => "lock:checkout:" + idempotencyKey;
 
-    private PaymentTokenRequest BuildPaymentTokenRequest(Transaction transaction, Product product)
+    private PaymentTokenRequest BuildPaymentTokenRequest(Transaction transaction, Product product, CustomerCard? card)
     {
         var app = appOptions.Value;
         var invoiceNo = transaction.InvoiceNo;
@@ -217,13 +314,17 @@ public sealed class CheckoutService(
             CurrencyCode: transaction.Currency,
             FrontendReturnUrl: $"{app.FrontendBaseUrl.TrimEnd('/')}/result?invoiceNo={Uri.EscapeDataString(invoiceNo)}",
             BackendReturnUrl: $"{app.PublicApiBaseUrl.TrimEnd('/')}/api/payments/2c2p/notification",
-            Intent: product.PaymentType switch
-            {
-                PaymentType.OneTime => PaymentIntent.NewPaymentMethod,
-                // Recurring products save the card so later charges can use the token.
-                PaymentType.Recurring => PaymentIntent.NewCardAndSave,
-                _ => throw new InvalidOperationException($"Unknown payment type {product.PaymentType}."),
-            });
+            Intent: card is not null
+                // Already saved, so it is charged by token whatever the product type.
+                ? PaymentIntent.SavedCard
+                : product.PaymentType switch
+                {
+                    PaymentType.OneTime => PaymentIntent.NewPaymentMethod,
+                    // Recurring products save the card so later charges can use the token.
+                    PaymentType.Recurring => PaymentIntent.NewCardAndSave,
+                    _ => throw new InvalidOperationException($"Unknown payment type {product.PaymentType}."),
+                },
+            CustomerToken: card?.CustomerToken);
     }
 
     private static CheckoutResult ToResult(Transaction transaction) =>

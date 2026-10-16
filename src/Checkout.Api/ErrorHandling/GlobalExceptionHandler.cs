@@ -6,7 +6,7 @@ namespace Checkout.Api.ErrorHandling;
 
 /// <summary>
 /// Turns unhandled exceptions into RFC 7807 responses. Known application exceptions map to
-/// 400/404/409/422/501 with their (safe) message; anything else is a logged 500 with no details sent.
+/// 400/404/409/422 with their (safe) message; anything else is a logged 500 with no details sent.
 /// </summary>
 internal sealed class GlobalExceptionHandler(
     IProblemDetailsService problemDetails,
@@ -17,7 +17,6 @@ internal sealed class GlobalExceptionHandler(
         var (status, title, detail) = exception switch
         {
             NotFoundException => (StatusCodes.Status404NotFound, "Resource not found", exception.Message),
-            FeatureNotImplementedException => (StatusCodes.Status501NotImplemented, "Not implemented", exception.Message),
             CheckoutInProgressException => (StatusCodes.Status409Conflict, "Checkout in progress", exception.Message),
             IdempotencyKeyReuseException => (StatusCodes.Status422UnprocessableEntity, "Idempotency key reused", exception.Message),
             // Unreadable or missing JSON body, or a parameter that can't be bound.

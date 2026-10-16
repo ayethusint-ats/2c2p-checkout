@@ -18,6 +18,7 @@ public class CheckoutServiceTests
     private readonly FakeCustomerRepository _customers = new();
     private readonly FakeProductRepository _products = new();
     private readonly FakeTransactionRepository _transactions = new();
+    private readonly FakeCustomerCardRepository _cards = new();
     private readonly FakePaymentProvider _provider = new();
     private readonly FakeDistributedLock _lock = new();
     private readonly CheckoutService _service;
@@ -37,8 +38,12 @@ public class CheckoutServiceTests
             Price = 4.99m, Currency = "SGD", PaymentType = PaymentType.Recurring,
         };
 
+        // The real processor (over the fakes), as in production: inquiry results go through the same rules.
+        var processor = new PaymentResultProcessor(
+            _transactions, _cards, new FixedTimeProvider(Now), NullLogger<PaymentResultProcessor>.Instance);
+
         _service = new CheckoutService(
-            _customers, _products, _transactions, _provider, _lock,
+            _customers, _products, _cards, _transactions, _provider, processor, _lock,
             new FixedTimeProvider(Now),
             Options.Create(new AppOptions
             {
@@ -190,16 +195,6 @@ public class CheckoutServiceTests
     {
         await Assert.ThrowsAsync<NotFoundException>(() =>
             _service.CheckoutAsync(Command(productId: 999), CancellationToken.None));
-
-        Assert.Empty(_transactions.Saved);
-        Assert.Empty(_provider.Requests);
-    }
-
-    [Fact]
-    public async Task Customer_card_id_is_rejected_as_not_implemented()
-    {
-        await Assert.ThrowsAsync<FeatureNotImplementedException>(() =>
-            _service.CheckoutAsync(Command(cardId: 5), CancellationToken.None));
 
         Assert.Empty(_transactions.Saved);
         Assert.Empty(_provider.Requests);
@@ -402,5 +397,222 @@ public class CheckoutServiceTests
         Assert.Equal(TransactionStatus.Pending, result.Status);
         Assert.NotNull(Assert.Single(_transactions.Saved).RedirectUrl);
     }
-}
 
+    // ---- Step 8: saved-card payments ----
+
+    private const int CardId = 5;
+    private const int OtherCustomersCardId = 6;
+
+    private void AddCards()
+    {
+        _cards.Cards.Add(new CustomerCard
+            { Id = CardId, CustomerId = CustomerId, CustomerToken = "CUST_TOKEN_5", MaskedCardNo = "411111XXXXXX1111" });
+        _cards.Cards.Add(new CustomerCard
+            { Id = OtherCustomersCardId, CustomerId = 2, CustomerToken = "CUST_TOKEN_6", MaskedCardNo = "522222XXXXXX2222" });
+    }
+
+    private static PaymentResultInfo InquiryResult(string invoiceNo, string respCode = "0000", string respDesc = "Success") =>
+        new("JT01", invoiceNo, 89.90m, "SGD", respCode, respDesc, "VI", "411111XXXXXX1111", "REF1", null);
+
+    private Task<CheckoutResult> PayWithCard(int cardId = CardId, string key = Key) =>
+        _service.CheckoutAsync(Command(cardId: cardId, key: key), CancellationToken.None);
+
+    [Theory]
+    [InlineData(OtherCustomersCardId)]
+    [InlineData(999)]
+    public async Task Card_of_another_customer_or_unknown_card_is_NotFound_and_provider_is_never_called(int cardId)
+    {
+        AddCards();
+
+        var ex = await Assert.ThrowsAsync<NotFoundException>(() => PayWithCard(cardId));
+
+        // Same message shape for both cases, so the response doesn't reveal that the card exists.
+        Assert.Equal($"Saved card {cardId} for customer {CustomerId} was not found.", ex.Message);
+        Assert.Empty(_provider.Requests);
+        Assert.Empty(_provider.DoPaymentCalls);
+        Assert.Empty(_transactions.Saved);
+    }
+
+    [Fact]
+    public async Task DoPayment_2000_then_inquiry_0000_is_Succeeded_without_redirect()
+    {
+        AddCards();
+        _provider.InquiryRespond = inv => InquiryResult(inv);
+
+        var result = await PayWithCard();
+
+        var tokenRequest = Assert.Single(_provider.Requests);
+        Assert.Equal(PaymentIntent.SavedCard, tokenRequest.Intent);
+        Assert.Equal("CUST_TOKEN_5", tokenRequest.CustomerToken);
+        Assert.Equal(("PT_123", "CUST_TOKEN_5"), Assert.Single(_provider.DoPaymentCalls));
+        Assert.Single(_provider.Inquiries);
+
+        var tx = Assert.Single(_transactions.Saved);
+        Assert.Equal(CardId, tx.CustomerCardId);
+        Assert.Equal(TransactionStatus.Succeeded, tx.Status);
+        Assert.Equal(new CheckoutResult(tx.InvoiceNo, TransactionStatus.Succeeded, null), result);
+    }
+
+    [Fact]
+    public async Task Inquiry_decline_is_Failed_with_the_codes()
+    {
+        AddCards();
+        _provider.InquiryRespond = inv => InquiryResult(inv, "4012", "Transaction declined");
+
+        var result = await PayWithCard();
+
+        var tx = Assert.Single(_transactions.Saved);
+        Assert.Equal(TransactionStatus.Failed, result.Status);
+        Assert.Null(result.RedirectUrl);
+        Assert.Equal("4012", tx.RespCode);
+        Assert.Equal("Transaction declined", tx.RespDesc);
+    }
+
+    [Fact]
+    public async Task DoPayment_other_code_also_inquires()
+    {
+        AddCards();
+        _provider.DoPaymentRespond = () => new DoPaymentResult(DoPaymentNextStep.InquireResult, "4200", "Tokenization failed", null);
+        _provider.InquiryRespond = inv => InquiryResult(inv);
+
+        var result = await PayWithCard();
+
+        Assert.Single(_provider.Inquiries);
+        Assert.Equal(TransactionStatus.Succeeded, result.Status);
+    }
+
+    [Fact]
+    public async Task DoPayment_1001_is_Pending_with_the_stored_url_and_no_inquiry()
+    {
+        AddCards();
+        _provider.DoPaymentRespond = () =>
+            new DoPaymentResult(DoPaymentNextStep.RedirectBrowser, "1001", "Redirect", "https://3ds.example/challenge");
+
+        var result = await PayWithCard();
+
+        var tx = Assert.Single(_transactions.Saved);
+        Assert.Equal("https://3ds.example/challenge", tx.RedirectUrl);
+        Assert.Equal(new CheckoutResult(tx.InvoiceNo, TransactionStatus.Pending, "https://3ds.example/challenge"), result);
+        Assert.Empty(_provider.Inquiries);
+    }
+
+    [Fact]
+    public async Task DoPayment_2001_is_Pending_without_inquiry()
+    {
+        AddCards();
+        _provider.DoPaymentRespond = () => new DoPaymentResult(DoPaymentNextStep.WaitForResult, "2001", "In progress", null);
+
+        var result = await PayWithCard();
+
+        Assert.Equal(TransactionStatus.Pending, result.Status);
+        Assert.Null(result.RedirectUrl);
+        Assert.Empty(_provider.Inquiries);
+    }
+
+    [Fact]
+    public async Task DoPayment_exception_leaves_the_row_Pending_not_Failed()
+    {
+        AddCards();
+        _provider.DoPaymentRespond = () => throw new PaymentProviderException("timed out");
+
+        var result = await PayWithCard();
+
+        var tx = Assert.Single(_transactions.Saved);
+        Assert.Equal(TransactionStatus.Pending, tx.Status);
+        Assert.Null(tx.RespCode);
+        Assert.Equal("PT_123", tx.PaymentToken);
+        Assert.Equal(new CheckoutResult(tx.InvoiceNo, TransactionStatus.Pending, null), result);
+        Assert.Empty(_provider.Inquiries);
+        Assert.Equal(1, Assert.Single(_lock.Handles).DisposeCount);
+    }
+
+    [Fact]
+    public async Task Inquiry_exception_leaves_the_row_Pending()
+    {
+        AddCards();
+        _provider.InquiryRespond = _ => throw new PaymentProviderException("timed out");
+
+        var result = await PayWithCard();
+
+        Assert.Equal(TransactionStatus.Pending, Assert.Single(_transactions.Saved).Status);
+        Assert.Equal(TransactionStatus.Pending, result.Status);
+        Assert.Null(result.RedirectUrl);
+    }
+
+    [Fact]
+    public async Task Saved_card_replay_returns_the_same_result_and_calls_the_provider_once()
+    {
+        AddCards();
+        _provider.InquiryRespond = inv => InquiryResult(inv);
+
+        var first = await PayWithCard();
+        var second = await PayWithCard();
+
+        Assert.Equal(first, second);
+        Assert.Single(_provider.Requests);
+        Assert.Single(_provider.DoPaymentCalls);
+        Assert.Single(_provider.Inquiries);
+    }
+
+    [Fact]
+    public async Task Replay_of_an_unknown_outcome_returns_Pending_at_once_instead_of_409()
+    {
+        AddCards();
+        _provider.DoPaymentRespond = () => throw new PaymentProviderException("timed out");
+        var first = await PayWithCard();
+
+        // No waiting and no 409: a 409 tells the client to use a new key, which could charge the card twice.
+        var second = await PayWithCard();
+
+        Assert.Equal(first, second);
+        Assert.Single(_provider.DoPaymentCalls);
+    }
+
+    [Fact]
+    public async Task Same_key_with_a_different_card_throws_reuse()
+    {
+        AddCards();
+        _cards.Cards.Add(new CustomerCard
+            { Id = 7, CustomerId = CustomerId, CustomerToken = "CUST_TOKEN_7", MaskedCardNo = "400000XXXXXX0002" });
+        _provider.InquiryRespond = inv => InquiryResult(inv);
+        await PayWithCard(CardId);
+
+        await Assert.ThrowsAsync<IdempotencyKeyReuseException>(() => PayWithCard(7));
+        Assert.Single(_provider.DoPaymentCalls);
+    }
+
+    [Fact]
+    public async Task Same_key_hosted_page_then_saved_card_throws_reuse()
+    {
+        AddCards();
+        await _service.CheckoutAsync(Command(), CancellationToken.None);
+
+        await Assert.ThrowsAsync<IdempotencyKeyReuseException>(() => PayWithCard());
+    }
+
+    [Fact]
+    public async Task Payment_token_failure_is_Failed_and_DoPayment_is_never_called()
+    {
+        AddCards();
+        _provider.Respond = _ => new PaymentTokenResult(false, null, null, "9042", "Invalid currency code.");
+
+        var result = await PayWithCard();
+
+        Assert.Equal(TransactionStatus.Failed, result.Status);
+        Assert.Equal("9042", Assert.Single(_transactions.Saved).RespCode);
+        Assert.Empty(_provider.DoPaymentCalls);
+    }
+
+    [Fact]
+    public async Task Payment_token_exception_is_Failed_ERROR_and_DoPayment_is_never_called()
+    {
+        AddCards();
+        _provider.Respond = _ => throw new PaymentProviderException("unreachable");
+
+        var result = await PayWithCard();
+
+        Assert.Equal(TransactionStatus.Failed, result.Status);
+        Assert.Equal("ERROR", Assert.Single(_transactions.Saved).RespCode);
+        Assert.Empty(_provider.DoPaymentCalls);
+    }
+}

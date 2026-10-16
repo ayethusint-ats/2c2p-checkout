@@ -53,6 +53,13 @@ internal sealed class FakeTransactionRepository : ITransactionRepository
     public Task<Transaction?> FindByInvoiceNoAsync(string invoiceNo, CancellationToken ct) =>
         Task.FromResult(Saved.SingleOrDefault(t => t.InvoiceNo == invoiceNo));
 
+    public Task<TransactionStatusDto?> GetStatusAsync(string invoiceNo, CancellationToken ct) =>
+        Task.FromResult(Saved.SingleOrDefault(t => t.InvoiceNo == invoiceNo) is { } t
+            ? new TransactionStatusDto(t.InvoiceNo, t.Status.ToString(), t.CustomerId, t.ProductId,
+                $"Product {t.ProductId}", t.Amount, t.Currency, t.PaymentChannel, t.MaskedCardNo, t.RespDesc,
+                t.PaidAt, t.CreatedAt)
+            : null);
+
     public int ConditionalUpdateCount { get; private set; }
 
     // Emulates "UPDATE … WHERE id = @id AND status = 'Pending'": changes the row only if Pending.
@@ -166,6 +173,30 @@ internal sealed class FakePaymentProvider : IPaymentProvider
         return Task.FromResult(Respond(request));
     }
 
+    public List<(string PaymentToken, string CustomerToken)> DoPaymentCalls { get; } = [];
+
+    /// <summary>Defaults to 2000 ("completed, inquire for the result").</summary>
+    public Func<DoPaymentResult> DoPaymentRespond { get; set; } = () =>
+        new DoPaymentResult(DoPaymentNextStep.InquireResult, "2000", "Transaction is completed", null);
+
+    public Task<DoPaymentResult> DoPaymentWithSavedCardAsync(string paymentToken, string customerToken, CancellationToken ct)
+    {
+        DoPaymentCalls.Add((paymentToken, customerToken));
+        return Task.FromResult(DoPaymentRespond());
+    }
+
+    public List<string> Inquiries { get; } = [];
+
+    /// <summary>Not configured by default: a test that inquires must say what 2C2P answers.</summary>
+    public Func<string, PaymentResultInfo> InquiryRespond { get; set; } =
+        _ => throw new InvalidOperationException("InquiryRespond is not configured");
+
+    public Task<PaymentResultInfo> InquirePaymentAsync(string invoiceNo, CancellationToken ct)
+    {
+        Inquiries.Add(invoiceNo);
+        return Task.FromResult(InquiryRespond(invoiceNo));
+    }
+
     public PaymentResultInfo? VerifyAndParseNotification(string payload) => throw new NotSupportedException();
 }
 
@@ -176,6 +207,9 @@ internal sealed class FakeCustomerCardRepository : ICustomerCardRepository
 
     public Task<IReadOnlyList<SavedCardDto>> GetByCustomerIdAsync(int customerId, CancellationToken ct) =>
         throw new NotSupportedException();
+
+    public Task<CustomerCard?> FindForCustomerAsync(int customerId, int cardId, CancellationToken ct) =>
+        Task.FromResult(Cards.SingleOrDefault(c => c.Id == cardId && c.CustomerId == customerId));
 
     public Task<bool> AddIfNotExistsAsync(int customerId, string customerToken, string maskedCardNo,
         DateTime createdAtUtc, CancellationToken ct)

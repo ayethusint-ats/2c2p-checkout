@@ -18,6 +18,12 @@ internal sealed class CustomerCardRepository(CheckoutDbContext db) : ICustomerCa
             .Select(cc => new SavedCardDto(cc.Id, cc.MaskedCardNo))
             .ToListAsync(ct);
 
+    // Both ids in one WHERE: a card id alone is not enough to charge a card.
+    public Task<CustomerCard?> FindForCustomerAsync(int customerId, int cardId, CancellationToken ct) =>
+        db.CustomerCards
+            .AsNoTracking()
+            .FirstOrDefaultAsync(cc => cc.Id == cardId && cc.CustomerId == customerId, ct);
+
     public async Task<bool> AddIfNotExistsAsync(int customerId, string customerToken, string maskedCardNo,
         DateTime createdAtUtc, CancellationToken ct)
     {

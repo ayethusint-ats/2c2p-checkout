@@ -2,7 +2,8 @@ namespace Checkout.Application.Checkout;
 
 public interface ICheckoutService
 {
-    /// <exception cref="Common.NotFoundException">The customer or product does not exist.</exception>
-    /// <exception cref="Common.FeatureNotImplementedException">A saved card was requested.</exception>
+    /// <exception cref="Common.NotFoundException">
+    /// The customer or product does not exist, or the saved card does not belong to the customer.
+    /// </exception>
     Task<CheckoutResult> CheckoutAsync(CheckoutCommand command, CancellationToken ct);
 }

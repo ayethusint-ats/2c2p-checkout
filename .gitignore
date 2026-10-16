@@ -5,6 +5,7 @@ appsettings.Development.json
 # .NET build output
 bin/
 obj/
+docs/
 
 # Node
 node_modules/
