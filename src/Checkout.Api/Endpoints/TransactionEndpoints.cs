@@ -16,6 +16,7 @@ public static class TransactionEndpoints
     {
         app.MapGet("/api/transactions/{invoiceNo}", GetTransaction)
             .WithTags("Transactions")
+            .RequireCors(CorsPolicies.Frontend)
             .WithName(nameof(GetTransaction))
             .AddOpenApiOperationTransformer((operation, _, _) =>
             {

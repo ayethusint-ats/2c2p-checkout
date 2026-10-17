@@ -16,6 +16,7 @@ public static class CheckoutEndpoints
     {
         app.MapPost("/api/checkout", Checkout)
             .WithTags("Checkout")
+            .RequireCors(CorsPolicies.Frontend)
             .WithName(nameof(Checkout))
             .AddOpenApiOperationTransformer((operation, _, _) =>
             {

@@ -12,7 +12,7 @@ public static class CatalogEndpoints
 {
     public static IEndpointRouteBuilder MapCatalogEndpoints(this IEndpointRouteBuilder app)
     {
-        var api = app.MapGroup("/api").WithTags("Catalog");
+        var api = app.MapGroup("/api").WithTags("Catalog").RequireCors(CorsPolicies.Frontend);
 
         api.MapGet("/customers", GetCustomers)
             .WithName(nameof(GetCustomers))

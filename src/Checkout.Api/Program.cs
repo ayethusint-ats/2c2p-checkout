@@ -24,6 +24,18 @@ builder.Services.Configure<RouteHandlerOptions>(options => options.ThrowOnBadReq
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
+// The frontend runs on another origin (http://localhost:3000), so the browser asks before calling us.
+// Only the configured origins, methods and headers are allowed; never AllowAnyOrigin.
+var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() is { Length: > 0 } origins
+    ? origins
+    : ["http://localhost:3000"];
+builder.Services.AddCors(options => options.AddPolicy(CorsPolicies.Frontend, policy => policy
+    .WithOrigins(allowedOrigins)
+    .WithMethods("GET", "POST", "OPTIONS")
+    .WithHeaders("Content-Type", "Idempotency-Key")
+    // Without this the browser hides Retry-After from the frontend's JavaScript on a 409.
+    .WithExposedHeaders("Retry-After")));
+
 builder.Services
     .AddApplication(builder.Configuration)
     .AddInfrastructure(builder.Configuration);
@@ -38,6 +50,9 @@ app.UseExceptionHandler();
 
 // Gives empty error responses (unknown route 404, 405, 415) a problem details body.
 app.UseStatusCodePages();
+
+// Applies the policy named by each endpoint's RequireCors (endpoints without one get no CORS headers).
+app.UseCors();
 
 // Only expose API docs in Development so production doesn't advertise its surface.
 if (app.Environment.IsDevelopment())

@@ -12,6 +12,7 @@ public static class PaymentNotificationEndpoints
     {
         app.MapPost("/api/payments/2c2p/notification", ReceiveNotification)
             .WithTags("Payments")
+            // No CORS policy: 2C2P calls this server to server, never from a browser.
             .WithName(nameof(ReceiveNotification))
             .AddOpenApiOperationTransformer((operation, _, _) =>
             {
