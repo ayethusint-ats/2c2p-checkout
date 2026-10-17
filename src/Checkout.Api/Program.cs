@@ -54,8 +54,9 @@ app.UseStatusCodePages();
 // Applies the policy named by each endpoint's RequireCors (endpoints without one get no CORS headers).
 app.UseCors();
 
-// Only expose API docs in Development so production doesn't advertise its surface.
-if (app.Environment.IsDevelopment())
+// API docs are on in Development, and elsewhere only when Swagger:Enabled is explicitly true
+// (docker-compose sets it). Off by default, so a production deployment doesn't advertise its surface.
+if (app.Environment.IsDevelopment() || app.Configuration.GetValue<bool>("Swagger:Enabled"))
 {
     app.MapOpenApi();
 

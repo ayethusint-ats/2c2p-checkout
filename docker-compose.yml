@@ -1,3 +1,7 @@
+# The whole system: docker compose up --build
+# Values come from .env (git-ignored; copy .env.example). Nothing secret is written here or baked
+# into an image: compose injects the values when the containers start.
+
 services:
   mysql:
     image: mysql:8
@@ -32,6 +36,47 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: src/Checkout.Api/Dockerfile
+    restart: unless-stopped
+    # Wait until MySQL and Redis actually answer, not just until their containers exist:
+    # the API runs migrations at startup and would fail against a MySQL still initialising.
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Production environment (the default): appsettings.Development.json isn't in the image anyway.
+      ASPNETCORE_URLS: http://+:8080
+      # "mysql" and "redis" are the service names on the compose network.
+      ConnectionStrings__Checkout: "Server=mysql;Port=3306;Database=${MYSQL_DATABASE:-checkout};User=${MYSQL_USER:-checkout};Password=${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}"
+      Redis__ConnectionString: redis:6379
+      TwoCTwoP__MerchantId: ${TWOCTWOP_MERCHANT_ID:?set TWOCTWOP_MERCHANT_ID in .env (2C2P sandbox merchant ID)}
+      TwoCTwoP__SecretKey: ${TWOCTWOP_SECRET_KEY:?set TWOCTWOP_SECRET_KEY in .env (2C2P sandbox secret key)}
+      # Where 2C2P posts the payment result: a public URL that reaches port 8080 (e.g. ngrok http 8080).
+      App__PublicApiBaseUrl: ${PUBLIC_API_BASE_URL:?set PUBLIC_API_BASE_URL in .env (public URL of the API, e.g. your ngrok URL)}
+      App__FrontendBaseUrl: http://localhost:3000
+      Cors__AllowedOrigins__0: http://localhost:3000
+      # Swagger UI at http://localhost:8080/swagger without switching to the Development environment.
+      Swagger__Enabled: "true"
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Built into the browser code: the address the BROWSER uses to reach the API.
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
 
 volumes:
   mysql-data:
