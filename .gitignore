@@ -18,3 +18,5 @@ node_modules/
 .DS_Store
 *.pdf
 *.md
+# ...except the project README
+!README.md

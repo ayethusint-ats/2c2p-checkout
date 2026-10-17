@@ -507,4 +507,55 @@ public class TwoCTwoPPaymentProviderTests
 
     private static HttpResponseMessage Json(object body) =>
         new(HttpStatusCode.OK) { Content = JsonContent.Create(body) };
+
+    // ---- converted currency ----
+
+    [Theory]
+    [InlineData(89.9)]
+    [InlineData("89.90")]
+    public void Notification_with_fx_fields_is_parsed(object fxAmount)
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+        var jwt = SignedNotification(new
+        {
+            merchantID = MerchantId, invoiceNo = "INV1", amount = 2178.77, currencyCode = "THB",
+            fxAmount, fxCurrencyCode = "SGD", respCode = "0000", respDesc = "Success",
+        });
+
+        var result = provider.VerifyAndParseNotification(jwt);
+
+        Assert.NotNull(result);
+        Assert.Equal(2178.77m, result.Amount);
+        Assert.Equal("THB", result.CurrencyCode);
+        Assert.Equal(89.90m, result.FxAmount);
+        Assert.Equal("SGD", result.FxCurrencyCode);
+    }
+
+    [Fact]
+    public void Notification_with_an_unreadable_fx_amount_is_rejected()
+    {
+        var (provider, _) = Create(_ => throw new InvalidOperationException());
+        var jwt = SignedNotification(new
+        {
+            merchantID = MerchantId, invoiceNo = "INV1", amount = 2178.77, currencyCode = "THB",
+            fxAmount = "abc", fxCurrencyCode = "SGD", respCode = "0000", respDesc = "Success",
+        });
+
+        Assert.Null(provider.VerifyAndParseNotification(jwt));
+    }
+
+    [Fact]
+    public async Task Inquiry_response_with_fx_fields_is_parsed()
+    {
+        var (provider, _) = Create(_ => Signed(new
+        {
+            merchantID = MerchantId, invoiceNo = "INV001", amount = "2178.77", currencyCode = "THB",
+            fxAmount = 89.9, fxCurrencyCode = "SGD", respCode = "0000", respDesc = "Success",
+        }));
+
+        var result = await provider.InquirePaymentAsync("INV001", CancellationToken.None);
+
+        Assert.Equal(89.90m, result.FxAmount);
+        Assert.Equal("SGD", result.FxCurrencyCode);
+    }
 }

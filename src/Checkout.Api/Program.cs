@@ -1,21 +1,40 @@
 using System.Text.Json.Serialization;
 using Checkout.Api.Endpoints;
 using Checkout.Api.ErrorHandling;
+using Checkout.Api.OpenApi;
 using Checkout.Application;
 using Checkout.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Built-in .NET OpenAPI document generator (served at /openapi/v1.json).
-builder.Services.AddOpenApi();
+// Built-in .NET OpenAPI document generator (served at /openapi/v1.json); see OpenApi/.
+builder.Services.AddCheckoutOpenApi();
 
-// RFC 7807 bodies for errors (adds traceId); the handler covers unhandled exceptions.
-builder.Services.AddProblemDetails();
+// Every error body is RFC 7807 problem details with the same fields, whoever produced it:
+// our endpoints, the exception handler, or the framework (404/405/415 via status code pages).
+builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = ProblemDetailsDefaults.Apply);
+builder.Services.AddSingleton<IProblemDetailsWriter, JsonProblemDetailsWriter>();
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+
+// Unreadable bodies and unbindable route values throw (and reach GlobalExceptionHandler) in every
+// environment. By default this only happens in Development; elsewhere they'd be empty 400s.
+builder.Services.Configure<RouteHandlerOptions>(options => options.ThrowOnBadRequest = true);
 
 // "OneTime" instead of 0 in responses (and in the OpenAPI schema).
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+
+// The frontend runs on another origin (http://localhost:3000), so the browser asks before calling us.
+// Only the configured origins, methods and headers are allowed; never AllowAnyOrigin.
+var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() is { Length: > 0 } origins
+    ? origins
+    : ["http://localhost:3000"];
+builder.Services.AddCors(options => options.AddPolicy(CorsPolicies.Frontend, policy => policy
+    .WithOrigins(allowedOrigins)
+    .WithMethods("GET", "POST", "OPTIONS")
+    .WithHeaders("Content-Type", "Idempotency-Key")
+    // Without this the browser hides Retry-After from the frontend's JavaScript on a 409.
+    .WithExposedHeaders("Retry-After")));
 
 builder.Services
     .AddApplication(builder.Configuration)
@@ -28,6 +47,12 @@ await app.Services.MigrateDatabaseAsync();
 
 // First in the pipeline so it catches exceptions from everything after it.
 app.UseExceptionHandler();
+
+// Gives empty error responses (unknown route 404, 405, 415) a problem details body.
+app.UseStatusCodePages();
+
+// Applies the policy named by each endpoint's RequireCors (endpoints without one get no CORS headers).
+app.UseCors();
 
 // Only expose API docs in Development so production doesn't advertise its surface.
 if (app.Environment.IsDevelopment())
@@ -42,10 +67,7 @@ if (app.Environment.IsDevelopment())
     });
 }
 
-// Liveness probe: answers "is the process up?" without touching MySQL or Redis.
-app.MapGet("/health", () => Results.Ok(new { status = "Healthy" }))
-    .WithName("GetHealth");
-
+app.MapHealthEndpoints();
 app.MapCatalogEndpoints();
 app.MapCheckoutEndpoints();
 app.MapPaymentNotificationEndpoints();

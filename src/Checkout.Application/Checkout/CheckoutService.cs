@@ -267,8 +267,19 @@ public sealed class CheckoutService(
         while (true)
         {
             var existing = await transactions.FindByIdempotencyKeyAsync(command.IdempotencyKey, ct);
-            if (existing is not null && TryGetCompletedResult(existing, command) is { } result)
-                return result;
+            if (existing is not null)
+            {
+                if (TryGetCompletedResult(existing, command) is { } result)
+                    return result;
+
+                // A saved-card charge that has started (token stored) but has no answer yet. While the worker
+                // holds the lock its answer is coming, so keep waiting. Once nobody holds it, the worker has
+                // finished without a final outcome (e.g. a Do Payment timeout): Pending is then the answer.
+                // A 409 here would push the client to a new key, and a new key could charge the card twice.
+                if (existing.CustomerCardId is not null && existing.PaymentToken is not null
+                    && await TryReadSettledResultAsync(command.IdempotencyKey, ct) is { } settled)
+                    return settled;
+            }
 
             if (timeProvider.GetElapsedTime(started) >= timeout)
                 throw new CheckoutInProgressException(command.IdempotencyKey);
@@ -286,18 +297,44 @@ public sealed class CheckoutService(
             || existing.CustomerCardId != command.CustomerCardId)
             throw new IdempotencyKeyReuseException(command.IdempotencyKey);
 
-        // A saved-card row with a payment token may already have been charged, so it is complete even
-        // while Pending: replaying it returns Pending, and the client follows up on the status endpoint.
-        // Waiting would end in 409 ("use a new key"), and a new key could charge the card twice.
-        var isComplete = existing.Status != TransactionStatus.Pending
-            || existing.RedirectUrl is not null
-            || (existing.CustomerCardId is not null && existing.PaymentToken is not null);
+        // Final, or Pending with a page for the customer (hosted page or 3-D Secure). Anything else
+        // is still being worked on; WaitForResultAsync decides how long to wait for it.
+        var isComplete = existing.Status != TransactionStatus.Pending || existing.RedirectUrl is not null;
         if (!isComplete)
             return null;
 
         logger.LogInformation("Replayed existing transaction {InvoiceNo} for idempotency key {IdempotencyKey}",
             existing.InvoiceNo, command.IdempotencyKey);
         return ToResult(existing);
+    }
+
+    /// <summary>
+    /// The row's current state if nobody holds the key's lock (its worker has finished); null if the lock is
+    /// held, or if Redis is down so we can't tell (then the caller keeps waiting, as without this check).
+    /// </summary>
+    private async Task<CheckoutResult?> TryReadSettledResultAsync(string idempotencyKey, CancellationToken ct)
+    {
+        ILockHandle? lockHandle;
+        try
+        {
+            lockHandle = await distributedLock.TryAcquireAsync(
+                LockKey(idempotencyKey), TimeSpan.FromSeconds(checkoutOptions.Value.LockTtlSeconds), ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+
+        if (lockHandle is null)
+            return null;
+
+        // Re-read while holding the lock: the worker may have finished between our last read and now,
+        // and this read is guaranteed to see its final write.
+        await using (lockHandle)
+        {
+            var current = await transactions.FindByIdempotencyKeyAsync(idempotencyKey, ct);
+            return current is null ? null : ToResult(current);
+        }
     }
 
     private static string LockKey(string idempotencyKey) => "lock:checkout:" + idempotencyKey;

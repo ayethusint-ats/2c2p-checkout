@@ -58,8 +58,10 @@ public sealed class PaymentResultProcessor(
         {
             logger.LogError(
                 "Payment result for invoice {InvoiceNo} does not match the transaction: " +
-                "received {ReceivedAmount} {ReceivedCurrency}, expected {ExpectedAmount} {ExpectedCurrency}. Not applied.",
-                result.InvoiceNo, result.Amount, result.CurrencyCode, transaction.Amount, transaction.Currency);
+                "received {ReceivedAmount} {ReceivedCurrency} (fx {FxAmount} {FxCurrency}), " +
+                "expected {ExpectedAmount} {ExpectedCurrency}. Not applied.",
+                result.InvoiceNo, result.Amount, result.CurrencyCode, result.FxAmount, result.FxCurrencyCode,
+                transaction.Amount, transaction.Currency);
             return PaymentResultOutcome.AmountOrCurrencyMismatch;
         }
 
@@ -120,6 +122,13 @@ public sealed class PaymentResultProcessor(
     // no money, so missing values are accepted, but values that are present must still match.
     private static bool MatchesTransaction(PaymentResultInfo result, Transaction transaction, bool requireAmountAndCurrency)
     {
+        // Converted by the provider (merchant account in another currency): the fx pair is what we asked
+        // the customer to pay. Both values must be present and equal, as strict as the direct check.
+        if (result.FxAmount is { } fxAmount && !string.IsNullOrEmpty(result.FxCurrencyCode)
+            && fxAmount == transaction.Amount
+            && string.Equals(result.FxCurrencyCode, transaction.Currency, StringComparison.OrdinalIgnoreCase))
+            return true;
+
         var amountOk = result.Amount is { } amount
             ? amount == transaction.Amount
             : !requireAmountAndCurrency;

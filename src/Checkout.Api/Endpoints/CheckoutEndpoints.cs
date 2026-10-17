@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+using Checkout.Api.OpenApi;
 using Checkout.Application.Checkout;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
@@ -14,6 +16,7 @@ public static class CheckoutEndpoints
     {
         app.MapPost("/api/checkout", Checkout)
             .WithTags("Checkout")
+            .RequireCors(CorsPolicies.Frontend)
             .WithName(nameof(Checkout))
             .AddOpenApiOperationTransformer((operation, _, _) =>
             {
@@ -21,15 +24,53 @@ public static class CheckoutEndpoints
                 if (operation.Parameters?.FirstOrDefault(p => p.Name == IdempotencyKeyHeader) is OpenApiParameter header)
                 {
                     header.Required = true;
+                    header.Example = OpenApiExamples.IdempotencyKey;
+                    header.Schema = new OpenApiSchema
+                    {
+                        Type = JsonSchemaType.String,
+                        Format = "uuid",
+                        MaxLength = MaxIdempotencyKeyLength,
+                    };
                     header.Description =
-                        "A new GUID per checkout attempt. Retrying with the same key returns the original result " +
-                        "instead of creating a second payment.";
+                        "A new GUID for each checkout attempt, reused for every retry of that attempt. " +
+                        "Same key again: the original response is returned and 2C2P is not called again. " +
+                        "Same key while the first request is still running: the request waits briefly for its result, " +
+                        "then answers 409 with Retry-After (retry with the same key). " +
+                        "Same key for a different customer, product or card: 422.";
                 }
+
+                OpenApiExamples.SetRequestExamples(operation,
+                    ("oneTime", "One-time product (2C2P payment page)",
+                        new JsonObject { ["customerId"] = 1, ["productId"] = 1, ["customerCardId"] = null }),
+                    ("recurring", "Recurring product (payment page; the card is saved)",
+                        new JsonObject { ["customerId"] = 1, ["productId"] = 3, ["customerCardId"] = null }),
+                    ("savedCard", "Pay with a saved card",
+                        new JsonObject { ["customerId"] = 1, ["productId"] = 1, ["customerCardId"] = 1 }));
+
+                OpenApiExamples.SetResponseExamples(operation, 200,
+                    ("hostedPagePending", "Payment page created: send the customer to redirectUrl",
+                        Result("Pending", OpenApiExamples.PaymentPageUrl)),
+                    ("savedCardSucceeded", "Saved card charged",
+                        Result("Succeeded", null)),
+                    ("failed", "2C2P rejected the payment",
+                        Result("Failed", null)));
+
+                OpenApiExamples.SetResponseExample(operation, 400,
+                    OpenApiExamples.ValidationProblem(IdempotencyKeyHeader, $"The {IdempotencyKeyHeader} header must be a GUID."));
+                OpenApiExamples.SetResponseExample(operation, 404,
+                    OpenApiExamples.Problem(404, "Resource not found", "Saved card 7 for customer 1 was not found."));
                 return Task.CompletedTask;
             });
 
         return app;
     }
+
+    private static JsonObject Result(string status, string? redirectUrl) => new()
+    {
+        ["invoiceNo"] = OpenApiExamples.InvoiceNo,
+        ["status"] = status,
+        ["redirectUrl"] = redirectUrl,
+    };
 
     public sealed record CheckoutRequest(int CustomerId, int ProductId, int? CustomerCardId);
 
@@ -41,6 +82,7 @@ public static class CheckoutEndpoints
         "Pending with a redirectUrl when the customer must complete 3-D Secure; Pending without a redirectUrl when " +
         "the outcome is not known yet (poll GET /api/transactions/{invoiceNo}). " +
         "Status is Failed (with no redirectUrl) if 2C2P rejected the payment token request or could not be reached. " +
+        "400: invalid input; errors names each invalid field. " +
         "404: unknown customer or product, or a card that does not belong to the customer. " +
         "409 (with Retry-After): another request with the same key is still running; retry with the same key. " +
         "422: the key was already used for a different customer, product or card.")]
@@ -69,6 +111,8 @@ public static class CheckoutEndpoints
             errors["customerId"] = ["customerId must be a positive integer."];
         if (body.ProductId <= 0)
             errors["productId"] = ["productId must be a positive integer."];
+        if (body.CustomerCardId is <= 0)
+            errors["customerCardId"] = ["customerCardId must be a positive integer when given."];
 
         if (errors.Count > 0)
             return TypedResults.ValidationProblem(errors);
