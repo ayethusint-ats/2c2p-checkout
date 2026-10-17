@@ -561,7 +561,8 @@ public class CheckoutServiceTests
         _provider.DoPaymentRespond = () => throw new PaymentProviderException("timed out");
         var first = await PayWithCard();
 
-        // No waiting and no 409: a 409 tells the client to use a new key, which could charge the card twice.
+        // Nobody holds the lock any more, so Pending is the answer: no 409, which would push the
+        // client to a new key and possibly a second charge.
         var second = await PayWithCard();
 
         Assert.Equal(first, second);
@@ -613,6 +614,80 @@ public class CheckoutServiceTests
 
         Assert.Equal(TransactionStatus.Failed, result.Status);
         Assert.Equal("ERROR", Assert.Single(_transactions.Saved).RespCode);
+        Assert.Empty(_provider.DoPaymentCalls);
+    }
+
+    // ---- waiting for a saved-card charge in progress ----
+
+    // A saved-card row whose charge has started: token stored, still Pending, no 3-D Secure page.
+    private void AddChargeInProgress() => _transactions.Saved.Add(new Transaction
+    {
+        CustomerId = CustomerId,
+        ProductId = OneTimeProductId,
+        CustomerCardId = CardId,
+        InvoiceNo = "INV20261015WORKER01",
+        IdempotencyKey = Key,
+        Amount = 89.90m,
+        Currency = "SGD",
+        Status = TransactionStatus.Pending,
+        PaymentToken = "PT_WORKER",
+    });
+
+    [Fact]
+    public async Task Waiter_keeps_waiting_while_the_lock_is_held_and_returns_the_final_result()
+    {
+        AddCards();
+        AddChargeInProgress();
+        _lock.Behaviour = LockBehaviour.Busy;
+        // The worker finishes while we wait.
+        _transactions.BeforeFind = call =>
+        {
+            if (call == 4)
+                _transactions.Saved[0].Status = TransactionStatus.Succeeded;
+        };
+
+        var result = await PayWithCard();
+
+        Assert.Equal(new CheckoutResult("INV20261015WORKER01", TransactionStatus.Succeeded, null), result);
+        Assert.Empty(_provider.Requests);
+        Assert.Empty(_provider.DoPaymentCalls);
+    }
+
+    [Fact]
+    public async Task Waiter_gets_409_if_the_lock_is_held_past_the_wait_timeout()
+    {
+        AddCards();
+        AddChargeInProgress();
+        _lock.Behaviour = LockBehaviour.Busy;
+
+        await Assert.ThrowsAsync<CheckoutInProgressException>(() => PayWithCard());
+
+        Assert.Empty(_provider.DoPaymentCalls);
+    }
+
+    [Fact]
+    public async Task Waiter_returns_Pending_once_nobody_holds_the_lock()
+    {
+        AddCards();
+        AddChargeInProgress();
+
+        var result = await PayWithCard();
+
+        Assert.Equal(new CheckoutResult("INV20261015WORKER01", TransactionStatus.Pending, null), result);
+        // The lock was taken only to check, and released at once.
+        Assert.Equal(1, Assert.Single(_lock.Handles).DisposeCount);
+        Assert.Empty(_provider.DoPaymentCalls);
+    }
+
+    [Fact]
+    public async Task Waiter_keeps_waiting_when_redis_is_down_because_it_cannot_tell()
+    {
+        AddCards();
+        AddChargeInProgress();
+        _lock.Behaviour = LockBehaviour.Throw;
+
+        await Assert.ThrowsAsync<CheckoutInProgressException>(() => PayWithCard());
+
         Assert.Empty(_provider.DoPaymentCalls);
     }
 }
