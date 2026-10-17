@@ -1,0 +1,10 @@
+# Keeps the API build context small and free of local output and secrets.
+**/bin
+**/obj
+.git
+tests
+frontend
+**/node_modules
+.env
+**/appsettings.Development.json
+**/appsettings.Development.example.json
