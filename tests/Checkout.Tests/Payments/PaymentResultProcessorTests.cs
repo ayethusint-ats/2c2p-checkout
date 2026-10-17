@@ -274,4 +274,45 @@ public class PaymentResultProcessorTests
         Assert.Equal(PaymentResultOutcome.AmountOrCurrencyMismatch, outcome);
         Assert.Equal(TransactionStatus.Pending, _tx.Status);
     }
+
+    // ---- converted currency (e.g. the 2C2P demo merchant settles in THB) ----
+
+    [Fact]
+    public async Task Success_in_another_currency_with_a_matching_fx_amount_is_applied()
+    {
+        var result = Result(amount: 2178.77m, currency: "THB") with { FxAmount = 89.90m, FxCurrencyCode = "SGD" };
+
+        var outcome = await _processor.ApplyAsync(result, CancellationToken.None);
+
+        Assert.Equal(PaymentResultOutcome.Applied, outcome);
+        Assert.Equal(TransactionStatus.Succeeded, _tx.Status);
+        Assert.Single(_cards.Cards);
+    }
+
+    [Theory]
+    [InlineData(1.00, "SGD")]     // the fx amount is wrong
+    [InlineData(89.90, "USD")]    // the fx currency is wrong
+    [InlineData(89.90, null)]     // the fx currency is missing
+    public async Task Success_in_another_currency_without_an_exact_fx_match_is_a_mismatch(double fxAmount, string? fxCurrency)
+    {
+        var result = Result(amount: 2178.77m, currency: "THB") with { FxAmount = (decimal)fxAmount, FxCurrencyCode = fxCurrency };
+
+        var outcome = await _processor.ApplyAsync(result, CancellationToken.None);
+
+        Assert.Equal(PaymentResultOutcome.AmountOrCurrencyMismatch, outcome);
+        Assert.Equal(TransactionStatus.Pending, _tx.Status);
+        Assert.Empty(_cards.Cards);
+    }
+
+    [Fact]
+    public async Task Failure_in_another_currency_with_a_matching_fx_amount_is_applied_as_Failed()
+    {
+        var result = Result("4012", "Transaction declined", amount: 2178.77m, currency: "THB")
+            with { FxAmount = 89.90m, FxCurrencyCode = "SGD" };
+
+        var outcome = await _processor.ApplyAsync(result, CancellationToken.None);
+
+        Assert.Equal(PaymentResultOutcome.Applied, outcome);
+        Assert.Equal(TransactionStatus.Failed, _tx.Status);
+    }
 }

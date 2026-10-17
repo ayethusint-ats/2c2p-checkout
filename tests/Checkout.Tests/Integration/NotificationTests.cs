@@ -153,4 +153,25 @@ public class NotificationTests(IntegrationFixture fixture)
         Assert.Equal("411111XXXXXX1111", status.MaskedCardNo);
         Assert.NotNull(status.PaidAt);
     }
+
+    // ---- converted currency, end to end (what the 2C2P demo merchant actually sends) ----
+
+    [Fact]
+    public async Task Success_settled_in_another_currency_is_applied_when_the_fx_amount_matches()
+    {
+        await using var app = fixture.CreateApp(new FakeTwoCTwoPHandler());
+        var client = app.CreateClient();
+        var tx = await CreatePendingTransaction(app, client);
+        var customerToken = NewCustomerToken();
+        var fields = ResultFields(tx.InvoiceNo, tx.Amount * 24.2354868m, customerToken: customerToken);
+        fields["currencyCode"] = "THB";
+        fields["fxAmount"] = tx.Amount;
+        fields["fxCurrencyCode"] = "SGD";
+
+        var response = await PostNotification(client, SignedNotification(fields));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(TransactionStatus.Succeeded, (await TransactionByInvoice(app, tx.InvoiceNo)).Status);
+        Assert.Equal(1, await CardCount(app, customerToken));
+    }
 }

@@ -172,10 +172,13 @@ internal sealed class TwoCTwoPPaymentProvider(
     private static PaymentResultInfo? MapResult(JsonElement root, string merchantId, string invoiceNo)
     {
         var respCode = GetString(root, "respCode");
-        if (string.IsNullOrEmpty(respCode) || !TryGetAmount(root, out var amount))
+        if (string.IsNullOrEmpty(respCode)
+            || !TryGetAmount(root, "amount", out var amount)
+            || !TryGetAmount(root, "fxAmount", out var fxAmount))
             return null;
 
         var currencyCode = GetString(root, "currencyCode");
+        var fxCurrencyCode = GetString(root, "fxCurrencyCode");
 
         return new PaymentResultInfo(
             merchantId,
@@ -187,16 +190,18 @@ internal sealed class TwoCTwoPPaymentProvider(
             GetString(root, "channelCode"),
             GetString(root, "accountNo"),
             GetString(root, "tranRef"),
-            GetString(root, "customerToken"));
+            GetString(root, "customerToken"),
+            fxAmount,
+            string.IsNullOrEmpty(fxCurrencyCode) ? null : fxCurrencyCode);
     }
 
     // 2C2P may send the amount as a number (230.87) or a string ("230.87"). Invariant culture,
     // and only digits with an optional decimal point: no sign, no thousands separators.
     // A missing (or null) amount is valid and gives null; a present but unreadable one is not.
-    private static bool TryGetAmount(JsonElement root, out decimal? amount)
+    private static bool TryGetAmount(JsonElement root, string name, out decimal? amount)
     {
         amount = null;
-        if (!root.TryGetProperty("amount", out var value) || value.ValueKind == JsonValueKind.Null)
+        if (!root.TryGetProperty(name, out var value) || value.ValueKind == JsonValueKind.Null)
             return true;
 
         switch (value.ValueKind)
